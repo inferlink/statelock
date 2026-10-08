@@ -1,0 +1,62 @@
+policies:
+  # examples/rogue_agent.py: an agent that clicks a button it must not click.
+  - agent_id: rogue_agent
+    target_url_contains: /demo/finance
+    pre_conditions:
+      - prohibit_click_text:
+          values:
+            - Mark as Paid
+  - agent_id: finance_reconciliation_agent
+    target_url_contains: /demo/finance
+    pre_conditions:
+      - require_page_text:
+          values:
+            - Bank Deposit
+            - ERP Invoice
+      - assert_field_equal:
+          left: bank_deposit_amount
+          right: erp_invoice_amount
+      - prohibit_click_text:
+          values:
+            - Delete
+            - Void
+    post_conditions:
+      - trigger:
+          click_text:
+            - Mark as Paid
+        require_page_text:
+          values:
+            - Reconciliation complete
+  # Two-page portal demo (/demo/bank then /demo/erp). The deposit is read on the
+  # bank page by CSS selector and remembered; the ERP page's rules compare it.
+  # Invoices over 10,000 are not blocked: they wait for a human reviewer (/review).
+  - agent_id: portal_reconciliation_agent
+    target_url_contains: /demo/erp
+    fields:
+      - name: bank_deposit
+        url_contains: /demo/bank
+        allowed_origins: ["http://statelock:8000", "http://localhost:8010"]
+        selector: "#deposit-amount"
+        remember: true
+      - name: erp_invoice
+        selector: "#invoice-amount"
+    pre_conditions:
+      - assert_field_equal:
+          left: remembered.bank_deposit
+          right: erp_invoice
+      - assert_compare:
+          left: erp_invoice
+          op: "<="
+          value: 10000
+          on_fail: review
+      - restrict_uploads:
+          extensions: [.pdf]
+          max_bytes: 5000000
+          max_files: 1
+    post_conditions:
+      - trigger:
+          click_text:
+            - Mark as Paid
+        require_page_text:
+          values:
+            - Reconciliation complete

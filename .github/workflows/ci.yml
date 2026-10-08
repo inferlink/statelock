@@ -1,0 +1,95 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:   # the Release workflow runs the same checks first
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Lint
+        run: |
+          ruff check src tests examples
+          ruff format --check src tests examples
+      - name: Type check
+        run: python -m mypy
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          pip install -e ".[dev]"
+          python -m playwright install --with-deps chromium
+      - name: Test
+        run: python -m pytest -q
+
+  # The integration tests that are skipped without their extras: browser-use, LangChain
+  # and the Stagehand OJS example. The CrewAI conversion test stays skipped: crewai's
+  # dependency pins conflict with browser-use's.
+  extras:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          pip install -e ".[dev,stagehand,langchain,browser-use]"
+          python -m playwright install --with-deps chromium
+      - name: Test
+        run: >-
+          python -m pytest -q -rs
+          tests/test_browser_browser_use.py tests/test_browser_langchain.py tests/test_example_ojs.py
+
+  # The JavaScript SDK (js/) and the TypeScript OJS example. Their tests start the Python
+  # test proxy (js/test/server.py, tests/browser_support.py), so the package and Chromium
+  # are installed too.
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            js/package-lock.json
+            examples/ojs-ts/package-lock.json
+      - name: Install
+        run: |
+          pip install -e ".[dev]"
+          python -m playwright install --with-deps chromium
+      - name: JS SDK tests
+        working-directory: js
+        run: |
+          npm ci
+          npm test
+      - name: TypeScript OJS example
+        run: |
+          (cd examples/ojs-ts && npm ci)
+          python -m pytest -q -rs tests/test_example_ojs_ts.py

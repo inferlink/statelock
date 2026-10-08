@@ -1,0 +1,114 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "statelock-ai"
+dynamic = ["version"]  # statelock.__version__
+description = "Guardrails and audit evidence for AI browser agents: a CDP proxy checks every action against the page's state before and after it happens. Works with Playwright, browser-use, Stagehand and LangChain."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "InferLink Corporation" }]
+requires-python = ">=3.10"
+keywords = ["ai-agents", "browser-automation", "guardrails", "playwright", "cdp", "agent-safety", "policy-engine"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Framework :: FastAPI",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Security",
+    "Topic :: Software Development :: Testing",
+    "Typing :: Typed",
+]
+dependencies = [
+    "fastapi>=0.110,<1",
+    "uvicorn[standard]>=0.29,<1",
+    "websockets>=14,<18",
+    "pydantic>=2.7,<3",
+    "pydantic-settings>=2.2,<3",
+    "pyyaml>=6,<7",
+    # AES-GCM for saved browser sessions.
+    "cryptography>=42",
+    # The proxy launches Playwright's bundled Chromium; the client SDK drives it.
+    # Docker pins the exact version to match its base image.
+    "playwright>=1.40,<2",
+]
+
+[project.urls]
+Homepage = "https://statelock.ai"
+Repository = "https://github.com/inferlink/statelock"
+Issues = "https://github.com/inferlink/statelock/issues"
+
+[project.optional-dependencies]
+dev = [
+    "playwright==1.56.0",
+    "pytest>=8,<9",
+    "httpx>=0.27,<1",
+    "ruff>=0.16,<0.17",
+    "mypy>=1.10",
+    "types-PyYAML",
+]
+# examples/ojs (a Stagehand agent); its tests are skipped without it.
+stagehand = ["stagehand>=0.4.1,<0.5"]
+# rule visual_assert with a vision-language model (STATELOCK_PERCEPTION_MODEL).
+vlm = ["litellm>=1.50"]
+# statelock.integrations.langchain: LangChain (and CrewAI) browser tools that stop on a violation.
+langchain = ["langchain-core>=0.3", "langchain-community>=0.3"]
+# statelock.integrations.browser_use: pass Statelock's CDP URL to browser-use (tested with 0.13).
+# browser-use needs Python 3.11+; on 3.10 the extra installs nothing and the integration says so.
+browser-use = ["browser-use>=0.13,<0.14; python_version >= '3.11'"]
+
+[project.scripts]
+statelock = "statelock.__main__:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "statelock.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"statelock" = ["py.typed"]
+"statelock.proxy.js" = ["*.js"]
+"statelock.demo" = ["*.html"]
+"statelock.review" = ["*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["browser: needs Playwright's Chromium (skipped when it is not installed)"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W", "I", "B", "UP", "ASYNC", "RUF",
+    "SIM", "C90", "RET", "ARG", "PIE", "BLE", "S", "PL", "FBT", "TRY", "PERF",
+]
+ignore = ["RUF012", "PLR2004", "PLR0913", "TRY003", "TRY300", "PERF203"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501", "ASYNC240", "S101", "ARG001", "FBT003", "PLC0415", "BLE001", "S603", "S607", "C901", "PLR0915"]
+
+[tool.mypy]
+mypy_path = "src"
+plugins = ["pydantic.mypy"]
+packages = ["statelock"]
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["statelock.core.*", "statelock.policy.*"]
+strict = true

@@ -1,0 +1,11 @@
+{
+  "_about": "Screenshots of /demo/finance (1280x720 JPEG, quality 60) and what a vision model must answer. Used by tests/test_perception_model.py when STATELOCK_PERCEPTION_MODEL is set.",
+  "check": {
+    "instruction": "The Bank Deposit amount equals the ERP Invoice amount.",
+    "extract": {"bank_deposit": "string", "erp_invoice": "string"}
+  },
+  "cases": [
+    {"image": "finance-match.jpg", "passed": true, "extracted": {"bank_deposit": "$5,000.00", "erp_invoice": "$5,000.00"}},
+    {"image": "finance-mismatch.jpg", "passed": false, "extracted": {"bank_deposit": "$4,900.00", "erp_invoice": "$5,000.00"}}
+  ]
+}

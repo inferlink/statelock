@@ -1,0 +1,242 @@
+# Development override: demo and debug routes, live source mounts, demo agents
+# and the test runner. The agents start once the proxy answers /health.
+#   docker compose -f compose.yaml -f compose.dev.yaml up --build
+x-dev-build: &dev-build
+  context: .
+  dockerfile: docker/Dockerfile
+  target: dev
+
+x-ojs-build: &ojs-build
+  context: .
+  dockerfile: docker/Dockerfile
+  target: ojs
+
+x-agent-env: &agent-env
+  STATELOCK_URL: http://statelock:8000  # the demo agents open session URLs (POST /sessions)
+  PYTHONUNBUFFERED: "1"
+
+services:
+  statelock:
+    build: *dev-build
+    image: statelock-dev
+    volumes:
+      - ./src:/src/statelock/src
+      - ./policies:/app/policies:ro
+      - ./artifacts:/app/artifacts
+      # Public development keys (docker/dev-keys.yaml); the demo agents use slk_dev_<agent_id>.
+      - ./docker/dev-keys.yaml:/app/keys.yaml:ro
+      # Development secrets for credential injection (the mock OJS password, from OJS_PASSWORD below).
+      - ./docker/dev-secrets.yaml:/app/secrets.yaml:ro
+    environment:
+      - STATELOCK_POLICY_FILE=/app/policies/default.yaml
+      # The OJS demo's policy and its custom rule (examples/ojs), next to the default policy.
+      - STATELOCK_EXTRA_POLICY_FILES=/app/examples/ojs/ojs_policy.yaml
+      - STATELOCK_RULE_MODULES=/app/examples/ojs/ojs_rules.py
+      - STATELOCK_ARTIFACT_DIR=/app/artifacts
+      - STATELOCK_AUTH_KEYS_FILE=/app/keys.yaml
+      # Development only: the saved-session key sits in the artifacts volume. In production, mount a secret.
+      - STATELOCK_SAVED_SESSIONS_KEY_FILE=/app/artifacts/keys/saved-sessions.key
+      - STATELOCK_SECRETS_FILE=/app/secrets.yaml
+      - OJS_PASSWORD=${OJS_PASSWORD:-mock-editor-pass}
+      - STATELOCK_DEBUG=1
+      - STATELOCK_DEMO=1
+
+  rogue-agent:
+    image: statelock-dev
+    build: *dev-build
+    profiles: [rogue-agent]
+    depends_on:
+      statelock: {condition: service_healthy}
+    environment:
+      <<: *agent-env
+      STATELOCK_API_KEY: slk_dev_rogue_agent
+    command: python /app/examples/rogue_agent.py
+
+  finance-agent:
+    image: statelock-dev
+    build: *dev-build
+    profiles: [finance-agent]
+    depends_on:
+      statelock: {condition: service_healthy}
+    environment:
+      <<: *agent-env
+      STATELOCK_API_KEY: slk_dev_finance_reconciliation_agent
+      STATELOCK_FINANCE_DEMO_URL: http://statelock:8000/demo/finance?scenario=mismatch
+      STATELOCK_EXPECT_BLOCK: "true"
+    command: python /app/examples/finance_agent.py
+
+  finance-pass-agent:
+    image: statelock-dev
+    build: *dev-build
+    profiles: [finance-pass-agent]
+    depends_on:
+      statelock: {condition: service_healthy}
+    environment:
+      <<: *agent-env
+      STATELOCK_API_KEY: slk_dev_finance_reconciliation_agent
+      STATELOCK_FINANCE_DEMO_URL: http://statelock:8000/demo/finance?scenario=match
+      STATELOCK_EXPECT_BLOCK: "false"
+    command: python /app/examples/finance_agent.py
+
+  portal-agent:
+    image: statelock-dev
+    build: *dev-build
+    profiles: [portal-agent]
+    depends_on:
+      statelock: {condition: service_healthy}
+    environment:
+      <<: *agent-env
+      STATELOCK_API_KEY: slk_dev_portal_reconciliation_agent
+      STATELOCK_PORTAL_BASE: http://statelock:8000
+      STATELOCK_PORTAL_SCENARIO: match
+      STATELOCK_EXPECT_BLOCK: "false"
+    command: python /app/examples/portal_agent.py
+
+  portal-block-agent:
+    image: statelock-dev
+    build: *dev-build
+    profiles: [portal-block-agent]
+    depends_on:
+      statelock: {condition: service_healthy}
+    environment:
+      <<: *agent-env
+      STATELOCK_API_KEY: slk_dev_portal_reconciliation_agent
+      STATELOCK_PORTAL_BASE: http://statelock:8000
+      STATELOCK_PORTAL_SCENARIO: mismatch
+      STATELOCK_EXPECT_BLOCK: "true"
+    command: python /app/examples/portal_agent.py
+
+  # Invoice over the review threshold: the agent waits until a reviewer approves or
+  # denies at http://localhost:8010/review (dev reviewer key: slk_dev_dev_reviewer).
+  portal-review-agent:
+    image: statelock-dev
+    build: *dev-build
+    profiles: [portal-review-agent]
+    depends_on:
+      statelock: {condition: service_healthy}
+    environment:
+      <<: *agent-env
+      STATELOCK_API_KEY: slk_dev_portal_reconciliation_agent
+      STATELOCK_PORTAL_BASE: http://statelock:8000
+      STATELOCK_PORTAL_SCENARIO: large
+      STATELOCK_EXPECT_BLOCK: "false"
+    command: python /app/examples/portal_agent.py
+
+  # OJS demo (examples/ojs): a Stagehand agent screening papers on a mock OJS journal.
+  # The agent holds no password (Statelock types {{secret:ojs_password}}) and keeps its
+  # login in a saved session. Results and manuscripts go to ./ojs-output.
+  #   docker compose --profile ojs-agent run --rm ojs-agent          # dry run: screens 101-103, fills and cancels the decline of 102
+  #   docker compose --profile ojs-record-agent run --rm ojs-record-agent   # records the decline of 102 (in the mock)
+  #   docker compose --profile ojs-block-agent run --rm ojs-block-agent    # tries "Send to Review": blocked, the session ends
+  ojs-mock:
+    image: statelock-ojs
+    build: *ojs-build
+    profiles: [ojs-agent, ojs-record-agent, ojs-block-agent]
+    environment:
+      MOCK_OJS_HOST: 0.0.0.0
+      PYTHONUNBUFFERED: "1"
+    command: python /app/examples/ojs/mock_ojs.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/index.php/journal/login')"]
+      interval: 2s
+      retries: 30
+
+  ojs-agent: &ojs-agent
+    image: statelock-ojs
+    build: *ojs-build
+    profiles: [ojs-agent]
+    depends_on:
+      statelock:
+        condition: service_healthy
+      ojs-mock:
+        condition: service_healthy
+    volumes:
+      - ./ojs-output:/app/ojs-output
+    environment: &ojs-env
+      <<: *agent-env
+      STATELOCK_API_KEY: slk_dev_ojs_screening_agent
+      OJS_BASE_URL: http://ojs-mock:8081/index.php/journal   # as the proxy's Chromium sees it
+      OJS_USERNAME: editor                                   # no password: Statelock types it
+      OJS_DECISIONS_FILE: /app/examples/ojs/demo_decisions.json
+      OJS_OUTPUT_DIR: /app/ojs-output
+    command: python /app/examples/ojs/ojs_agent.py
+
+  ojs-record-agent:
+    <<: *ojs-agent
+    profiles: [ojs-record-agent]
+    environment:
+      <<: *ojs-env
+      OJS_RECORD_DECISIONS: "1"
+
+  ojs-block-agent:
+    <<: *ojs-agent
+    profiles: [ojs-block-agent]
+    environment:
+      <<: *ojs-env
+      OJS_DEMO_PROHIBITED_CLICK: Send to Review   # the demo's rogue step: blocked by ojs_policy.yaml
+
+  statelock-tests:
+    image: statelock-dev
+    build: *dev-build
+    profiles: [test]
+    volumes:
+      - ./src:/src/statelock/src
+      - ./tests:/src/statelock/tests
+      # Repo files some tests validate (the default policy, the dev keys and secrets, this
+      # file and the OJS example it runs: tests/test_compose_ojs.py).
+      - ./policies:/src/statelock/policies:ro
+      - ./docker/dev-keys.yaml:/src/statelock/docker/dev-keys.yaml:ro
+      - ./docker/dev-secrets.yaml:/src/statelock/docker/dev-secrets.yaml:ro
+      - ./docker/Dockerfile:/src/statelock/docker/Dockerfile:ro
+      - ./compose.dev.yaml:/src/statelock/compose.dev.yaml:ro
+      - ./examples:/src/statelock/examples:ro
+    working_dir: /src/statelock
+    command: python -m pytest -q -p no:cacheprovider
+
+  # A local vision model for visual_assert, and the fixture test against it (profile vlm):
+  #   docker compose -f compose.dev.yaml --profile vlm up -d ollama
+  #   docker compose -f compose.dev.yaml --profile vlm run --rm ollama-pull       # download, with progress (once)
+  #   docker compose -f compose.dev.yaml --profile vlm run --rm perception-tests
+  # STATELOCK_VLM_MODEL picks the model (default qwen2.5vl:3b, about 4 GB of memory;
+  # qwen2.5vl:7b needs about 8 GB in Docker Desktop's resources). Docker on a Mac has no
+  # GPU, so the model runs on the CPU: same answers, much slower than native Ollama.
+  ollama:
+    image: ollama/ollama:latest
+    profiles: [vlm]
+    ports: ["127.0.0.1:11434:11434"]
+    volumes:
+      - ollama-models:/root/.ollama   # downloaded models survive restarts
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    profiles: [vlm]
+    depends_on:
+      ollama: {condition: service_healthy}
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "${STATELOCK_VLM_MODEL:-qwen2.5vl:3b}"]
+
+  perception-tests:
+    image: statelock-dev
+    build: *dev-build
+    profiles: [vlm]
+    depends_on:
+      ollama-pull: {condition: service_completed_successfully}
+    environment:
+      STATELOCK_PERCEPTION_MODEL: ollama_chat/${STATELOCK_VLM_MODEL:-qwen2.5vl:3b}
+      STATELOCK_PERCEPTION_API_BASE: http://ollama:11434
+      STATELOCK_PERCEPTION_LOCAL_ONLY: "true"   # the screenshots stay inside the Docker network
+      STATELOCK_PERCEPTION_TIMEOUT: "300"       # seconds per call: CPU inference is slow
+    volumes:
+      - ./src:/src/statelock/src
+      - ./tests:/src/statelock/tests
+    working_dir: /src/statelock
+    command: python -m pytest -v -p no:cacheprovider tests/test_perception_model.py
+
+volumes:
+  ollama-models:

@@ -1,0 +1,26 @@
+# DEVELOPMENT KEYS ONLY. These keys are public (they are in this repository).
+# compose.dev.yaml uses them for the demo agents. Never use this file in a deployment:
+# create real keys with `statelock keygen --agent-id <id>`.
+#
+# Plaintext dev keys: slk_dev_<agent_id, reviewer_id or auditor_id>
+agents:
+  - agent_id: rogue_agent
+    tenant: dev
+    key_sha256: c07e3b0f549075ac141dd2c99775877cbabb5d7c06f538b85e0a16c23a402844
+  - agent_id: finance_reconciliation_agent
+    tenant: dev
+    key_sha256: bd1a3469412982bca8216216fb64ca3b1f14e47eadb5dded9fe2bf0b350043d6
+  - agent_id: portal_reconciliation_agent
+    tenant: dev
+    key_sha256: ce5bb18b689eae320a9175d5b1baf0fb2982114215d4505eddf85e57bc2384de
+  - agent_id: ojs_screening_agent
+    tenant: dev
+    key_sha256: d99e355eaf614beb3c98329b02a19923d7ed1f46ddd09c1afe931652d2c666bd
+reviewers:
+  - reviewer_id: dev_reviewer
+    tenant: dev
+    key_sha256: 4fa4dfe7f15e033585d375a72948366e92abb0d33cb2ed6d5309898496697c05
+auditors:
+  - auditor_id: dev_auditor
+    tenant: dev
+    key_sha256: 72b6458a2df521afc10a3dc6785f8c074c87aa05a9767fcd77f352116b202196

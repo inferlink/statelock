@@ -1,0 +1,74 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Statelock Finance Demo</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 40px;
+        color: #1f2933;
+      }
+      main {
+        max-width: 760px;
+        margin: 0 auto;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 24px;
+        padding: 16px 0;
+        border-bottom: 1px solid #d9dee5;
+      }
+      .label {
+        font-weight: 700;
+      }
+      .amount {
+        font-variant-numeric: tabular-nums;
+      }
+      button {
+        margin-top: 28px;
+        padding: 12px 16px;
+        font-weight: 700;
+      }
+      #status {
+        margin-top: 20px;
+        font-weight: 700;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Bank Portal to ERP Reconciliation</h1>
+      <p>Review the bank deposit against the ERP invoice before marking the invoice as paid.</p>
+      <section>
+        <div class="row">
+          <div>
+            <div class="label">Bank Deposit</div>
+            <div>Customer wire transfer received today</div>
+          </div>
+          <div
+            class="amount"
+            data-statelock-key="bank_deposit_amount"
+            data-statelock-value="__BANK_AMOUNT__"
+          >__BANK_AMOUNT__</div>
+        </div>
+        <div class="row">
+          <div>
+            <div class="label">ERP Invoice</div>
+            <div>Invoice INV-1042 open balance</div>
+          </div>
+          <div
+            class="amount"
+            data-statelock-key="erp_invoice_amount"
+            data-statelock-value="__ERP_AMOUNT__"
+          >__ERP_AMOUNT__</div>
+        </div>
+      </section>
+      <button
+        type="button"
+        onclick="document.getElementById('status').innerText = 'Reconciliation complete'"
+      >Mark as Paid</button>
+      <div id="status" data-statelock-key="reconciliation_status"></div>
+    </main>
+  </body>
+</html>

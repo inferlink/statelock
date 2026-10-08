@@ -1,0 +1,40 @@
+# Statelock proxy. Create keys.yaml first (statelock keygen --agent-id ID --append keys.yaml);
+# Compose does not start without it. For demos, agents and tests, add compose.dev.yaml
+# (see .env.example).
+services:
+  statelock:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: runtime
+    container_name: statelock
+    # Chromium runs with its sandbox: the image runs as the non-root pwuser, and the
+    # seccomp profile (docker/seccomp_profile.json, Playwright's) allows the user
+    # namespaces the sandbox needs. Set STATELOCK_CHROMIUM_SANDBOX=0 in .env only on
+    # hosts that cannot use the profile. See docker/README-sandbox.md.
+    init: true
+    security_opt:
+      - seccomp=./docker/seccomp_profile.json
+    ports:
+      - "${STATELOCK_BIND_HOST:-127.0.0.1}:${STATELOCK_HOST_PORT:-8010}:8000"
+    volumes:
+      - ./policies:/app/policies:ro
+      - ./artifacts:/app/artifacts
+      # API keys file (hashes only), created with `statelock keygen`. See README, Authentication.
+      # It must exist: Compose would otherwise create a root-owned directory in its place.
+      - type: bind
+        source: ${STATELOCK_KEYS_FILE:-./keys.yaml}
+        target: /app/keys.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      - STATELOCK_POLICY_FILE=/app/policies/default.yaml
+      - STATELOCK_ARTIFACT_DIR=/app/artifacts
+      - STATELOCK_AUTH_KEYS_FILE=/app/keys.yaml
+      - STATELOCK_CHROMIUM_SANDBOX=${STATELOCK_CHROMIUM_SANDBOX:-1}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30

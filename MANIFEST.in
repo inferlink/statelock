@@ -1,0 +1,5 @@
+recursive-include tests *.py *.json *.jpg
+recursive-include examples *.py *.ts *.json *.yaml *.md
+recursive-include policies *.yaml
+recursive-include docker Dockerfile *.yaml *.json *.md
+include compose.yaml compose.dev.yaml

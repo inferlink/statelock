@@ -1,0 +1,173 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Statelock review</title>
+<style>
+  :root { --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #5d6677; --line: #dde1e8;
+          --accent: #2458d6; --ok: #1d7a46; --bad: #b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171d; --card: #1d2129; --text: #e7e9ee; --muted: #9aa3b2; --line: #2e3440;
+            --accent: #7aa2ff; --ok: #5cc98a; --bad: #ff8a80; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+           padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--card); }
+  h1 { font-size: 17px; margin: 0; }
+  main { max-width: 980px; margin: 0 auto; padding: 16px; }
+  input, textarea, button { font: inherit; color: inherit; }
+  input, textarea { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  textarea { width: 100%; min-height: 54px; resize: vertical; }
+  button { border: 1px solid var(--line); background: var(--card); border-radius: 6px; padding: 6px 14px; cursor: pointer; }
+  button.approve { background: var(--ok); border-color: var(--ok); color: #fff; }
+  button.deny { background: var(--bad); border-color: var(--bad); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .action { font-size: 17px; font-weight: 600; margin: 0 0 6px; overflow-wrap: anywhere; }
+  .meta { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+  .failure { border-left: 3px solid var(--bad); padding: 4px 10px; margin: 10px 0; }
+  .failure b { font-family: ui-monospace, monospace; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; margin-top: 12px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  img { max-width: 100%; border: 1px solid var(--line); border-radius: 6px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  td { border-top: 1px solid var(--line); padding: 4px 6px; vertical-align: top; overflow-wrap: anywhere; }
+  td:first-child { color: var(--muted); white-space: nowrap; }
+  .buttons { display: flex; gap: 8px; margin-top: 8px; }
+  .empty, .status { color: var(--muted); }
+  .error { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Statelock review</h1>
+  <form id="key-form">
+    <input id="key" type="password" placeholder="Reviewer key" autocomplete="off" aria-label="Reviewer key">
+    <button type="submit">Use key</button>
+  </form>
+</header>
+<main>
+  <p id="status" class="status" role="status"></p>
+  <div id="reviews"></div>
+</main>
+<script>
+"use strict";
+const KEY_STORAGE = "statelock-reviewer-key";
+const list = document.getElementById("reviews");
+const statusLine = document.getElementById("status");
+let key = "";
+try { key = sessionStorage.getItem(KEY_STORAGE) || ""; } catch (_) {}
+const drafts = new Map();  // review_id -> comment typed so far
+const shots = new Map();   // review_id -> object URL
+let lastError = "";        // shown until the next decision succeeds
+
+document.getElementById("key-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  key = document.getElementById("key").value.trim();
+  try { sessionStorage.setItem(KEY_STORAGE, key); } catch (_) {}
+  document.getElementById("key").value = "";
+  refresh();
+});
+
+function headers() { return key ? { Authorization: "Bearer " + key } : {}; }
+
+function el(tag, attrs, ...children) {
+  const node = document.createElement(tag);
+  for (const [name, value] of Object.entries(attrs || {})) node.setAttribute(name, value);
+  for (const child of children) if (child != null) node.append(child);
+  return node;
+}
+
+function fieldTable(fields) {
+  const rows = Object.entries(fields || {});
+  if (!rows.length) return null;
+  return el("table", {}, ...rows.map(([name, value]) => {
+    const shown = value && typeof value === "object" && "value" in value ? value.value : value;
+    return el("tr", {}, el("td", {}, name), el("td", {}, String(shown)));
+  }));
+}
+
+async function screenshot(review) {
+  if (!review.has_screenshot) return null;
+  if (!shots.has(review.review_id)) {
+    const response = await fetch(`/reviews/${review.review_id}/screenshot`, { headers: headers() });
+    if (!response.ok) return null;
+    shots.set(review.review_id, URL.createObjectURL(await response.blob()));
+  }
+  return el("img", { src: shots.get(review.review_id), alt: "Page when the action was paused" });
+}
+
+async function decide(review, decision, card) {
+  for (const button of card.querySelectorAll("button")) button.disabled = true;
+  const response = await fetch(`/reviews/${review.review_id}/decision`, {
+    method: "POST",
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify({ decision, comment: drafts.get(review.review_id) || null }),
+  });
+  lastError = "";
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    lastError = `Could not ${decision}: ${body.detail || response.status}`;
+  }
+  drafts.delete(review.review_id);
+  refresh();
+}
+
+async function card(review) {
+  const comment = el("textarea", { placeholder: "Comment (stored with the evidence)", "aria-label": "Comment" });
+  comment.value = drafts.get(review.review_id) || "";
+  comment.addEventListener("input", () => drafts.set(review.review_id, comment.value));
+  const node = el("section", { class: "card" },
+    el("p", { class: "action" }, `${review.agent_id || "agent"} wants to ${review.action.description}`),
+    el("p", { class: "meta" }, `${review.page.title || ""} · ${review.page.url || ""}`),
+    el("p", { class: "meta" },
+       `Session ${review.session_id} · action #${review.sequence} · expires ${new Date(review.expires_at).toLocaleTimeString()}`),
+    ...review.failures.map((failure) => el("div", { class: "failure" },
+      el("b", {}, failure.rule), " ", failure.reason.replace(/^Blocked action because /, ""))),
+  );
+  const details = el("div", {}, fieldTable(review.page.fields), fieldTable(review.remembered), comment);
+  const approve = el("button", { class: "approve", type: "button" }, "Approve");
+  const deny = el("button", { class: "deny", type: "button" }, "Deny");
+  approve.addEventListener("click", () => decide(review, "approve", node));
+  deny.addEventListener("click", () => decide(review, "deny", node));
+  details.append(el("div", { class: "buttons" }, approve, deny));
+  node.append(el("div", { class: "grid" }, await screenshot(review), details));
+  return node;
+}
+
+let shown = "";
+async function refresh() {
+  if (document.activeElement && document.activeElement.tagName === "TEXTAREA") return;  // keep typing
+  let response;
+  try {
+    response = await fetch("/reviews", { headers: headers() });
+  } catch (_) {
+    statusLine.textContent = "Statelock is not reachable.";
+    return;
+  }
+  if (response.status === 401) {
+    statusLine.textContent = "Enter a reviewer key.";
+    statusLine.className = "status";
+    list.replaceChildren();
+    shown = "";
+    return;
+  }
+  const { reviews } = await response.json();
+  const ids = reviews.map((review) => review.review_id).join(",");
+  statusLine.className = lastError ? "status error" : "status";
+  statusLine.textContent = lastError || (reviews.length ? `${reviews.length} action(s) waiting for review.` : "");
+  if (ids === shown) return;
+  shown = ids;
+  list.replaceChildren(...(reviews.length
+    ? await Promise.all(reviews.map(card))
+    : [el("p", { class: "empty" }, "No actions are waiting for review.")]));
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

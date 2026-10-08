@@ -1,0 +1,65 @@
+{
+  "name": "@statelock/client",
+  "version": "0.1.0",
+  "description": "Statelock client for JavaScript and TypeScript agents: session URLs, saved sessions, violation errors, and governed Playwright uploads and downloads.",
+  "keywords": [
+    "ai-agents",
+    "browser-automation",
+    "playwright",
+    "cdp",
+    "agent-safety",
+    "guardrails"
+  ],
+  "homepage": "https://statelock.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inferlink/statelock.git",
+    "directory": "js"
+  },
+  "bugs": {
+    "url": "https://github.com/inferlink/statelock/issues"
+  },
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./playwright": {
+      "types": "./dist/playwright.d.ts",
+      "default": "./dist/playwright.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "peerDependencies": {
+    "playwright-core": ">=1.40"
+  },
+  "peerDependenciesMeta": {
+    "playwright-core": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "playwright-core": "1.56.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Demo Bank Portal</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 40px; color: #1f2933; }
+      main { max-width: 760px; margin: 0 auto; }
+      table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+      td, th { text-align: left; padding: 12px 0; border-bottom: 1px solid #d9dee5; }
+      .amount { font-variant-numeric: tabular-nums; text-align: right; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Demo Bank Portal</h1>
+      <p>Incoming transfers for account ending 4417.</p>
+      <table>
+        <tr><th>Reference</th><th>Description</th><th class="amount">Amount</th></tr>
+        <tr>
+          <td>WIRE-88120</td>
+          <td>Customer wire transfer for INV-1042</td>
+          <td class="amount" id="deposit-amount">__BANK_AMOUNT__</td>
+        </tr>
+      </table>
+    </main>
+  </body>
+</html>

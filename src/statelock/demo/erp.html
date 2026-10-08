@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Demo ERP</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 40px; color: #1f2933; }
+      main { max-width: 760px; margin: 0 auto; }
+      .row { display: grid; grid-template-columns: 1fr auto; gap: 24px; padding: 16px 0; border-bottom: 1px solid #d9dee5; }
+      .label { font-weight: 700; }
+      .amount { font-variant-numeric: tabular-nums; }
+      button { margin-top: 28px; padding: 12px 16px; font-weight: 700; }
+      #status { margin-top: 20px; font-weight: 700; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Demo ERP: Accounts Receivable</h1>
+      <div class="row">
+        <div><div class="label">Invoice INV-1042</div><div>Open balance</div></div>
+        <div class="amount" id="invoice-amount">__ERP_AMOUNT__</div>
+      </div>
+      <div class="row">
+        <div><div class="label">Remittance advice</div><div>Attach the customer's remittance (PDF)</div></div>
+        <input type="file" id="remittance" name="remittance" />
+      </div>
+      <p id="attached">No file attached</p>
+      <button type="button" id="mark-paid">Mark as Paid</button>
+      <div id="status"></div>
+    </main>
+    <script>
+      const input = document.getElementById('remittance');
+      input.addEventListener('change', () => {
+        document.getElementById('attached').textContent = input.files.length
+          ? 'Attached: ' + input.files[0].name
+          : 'No file attached';
+      });
+      document.getElementById('mark-paid').addEventListener('click', () => {
+        document.getElementById('status').textContent = input.files.length
+          ? 'Reconciliation complete'
+          : 'Remittance advice required';
+      });
+    </script>
+  </body>
+</html>

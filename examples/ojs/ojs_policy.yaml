@@ -1,0 +1,135 @@
+# Statelock policy for the OJS screening agent (examples/ojs/ojs_agent.py).
+#
+# The browser checks a screening agent would make about itself are here,
+# enforced by Statelock instead: a misled or buggy agent cannot skip them. Each
+# entry names the agent step it covers. Point the target_url_contains values at
+# your journal's path; the mock site uses /index.php/journal.
+#
+# Needs the custom rule ojs_decision (examples/ojs/ojs_rules.py):
+#   STATELOCK_RULE_MODULES=examples/ojs/ojs_rules.py
+# and is loaded next to the default policy in the dev stacks:
+#   STATELOCK_EXTRA_POLICY_FILES=examples/ojs/ojs_policy.yaml
+policies:
+  # The whole journal: what screening may never do.
+  - id: ojs-journal
+    agent_id: ojs_screening_agent
+    target_url_contains: /index.php/journal
+    pre_conditions:
+      # Screening may only decline. Anything that moves a paper forward, removes it
+      # or changes who handles it is blocked (and ends the session).
+      - prohibit_click_text:
+          values:
+            - Send to Review
+            - Accept and Skip Review
+            - Send to Production
+            - Send to Copyediting
+            - Schedule For Publication
+            - Delete
+            - Remove
+            - Unassign
+            - Revert Decline
+            - Add Reviewer
+      # The agent downloads whatever the authors submitted (a .tex or .docx
+      # manuscript is exactly what the PDF check must see), within a size limit.
+      - restrict_downloads:
+          max_bytes: 100000000
+          max_downloads: 500
+      # The agent never uploads files.
+      - restrict_uploads:
+          max_files: 0
+
+  # Login (agent steps: Go Login, Enter username, Enter password, Click login).
+  - id: ojs-login
+    agent_id: ojs_screening_agent
+    target_url_contains: /index.php/journal/login
+    fields:
+      - {name: username_inputs, selector: "input#username", read: count}
+      - {name: password_inputs, selector: "input[type=password]", read: count}
+      - {name: login_buttons, selector: "form button[type=submit]", read: count}
+      - {name: username_value, selector: "input#username"}
+      - {name: password_length, selector: "input[type=password]", read: length}  # never the password
+      # Read on any journal page: checked after the login click, on the page it led to.
+      - {name: login_forms_after, selector: "input[type=password]", read: count, url_contains: /index.php/journal}
+    pre_conditions:
+      # On the login page, the form must be there before the agent types or clicks.
+      - assert_compare: {left: username_inputs, op: ">=", value: 1}
+      - assert_compare: {left: password_inputs, op: ">=", value: 1}
+      - assert_compare: {left: login_buttons, op: ">=", value: 1}
+      # Before "Login": the right account, and a password entered (Statelock typed the secret).
+      - trigger: {click_text: [Login], key: [Enter]}
+        assert_field_equal: {left: username_value, value: editor}
+      - trigger: {click_text: [Login], key: [Enter]}
+        assert_compare: {left: password_length, op: ">=", value: 1}
+    post_conditions:
+      # After "Login": logged in, so no login form, no error, and the journal menu.
+      - trigger: {click_text: [Login], key: [Enter]}
+        assert_compare: {left: login_forms_after, op: "==", value: 0}
+      - trigger: {click_text: [Login], key: [Enter]}
+        prohibit_page_text: {values: [Invalid username or password]}
+      - trigger: {click_text: [Login], key: [Enter]}
+        require_page_text: {values: [Submissions]}
+
+  # The submissions list (agent steps: Click Submissions, Get submissions, Get links).
+  - id: ojs-submissions
+    agent_id: ojs_screening_agent
+    target_url_contains: /index.php/journal/submissions
+    fields:
+      - {name: active_panels, selector: "#active", visible: true, read: count}
+    pre_conditions:
+      # The list page, with its All Active tab, before the agent acts on it.
+      - require_page_text: {values: [Submissions, All Active]}
+    post_conditions:
+      # After clicking "All Active": that list is the one shown.
+      - trigger: {click_text: [All Active]}
+        assert_compare: {left: active_panels, op: ">=", value: 1}
+
+  # A paper's workflow page (agent steps: Process paper, Judge paper, Reject paper).
+  - id: ojs-workflow
+    agent_id: ojs_screening_agent
+    target_url_contains: /index.php/journal/workflow/
+    fields:
+      - {name: url_paper_id, from_url: true, pattern: "/workflow/(?:index|access)/(\\d+)"}
+      - {name: page_paper_id, selector: ".pkpWorkflow__identificationId"}
+      - {name: decline_buttons, selector: "a[id^='decline-button-']", read: count}
+      - {name: decline_modals, selector: ".pkpModal", visible: true, read: count}
+      - {name: email_editors, selector: "iframe[id*='personalMessage']", read: count}
+      - {name: record_buttons, selector: "button.submitFormButton", visible: true, read: count}
+      - {name: decline_email, selector: "body", frame: "iframe[id*='personalMessage']"}
+      - {name: decline_email_length, selector: "body", frame: "iframe[id*='personalMessage']", read: length}
+    pre_conditions:
+      # Every action on a paper page (clicks, typing, downloads): the page is the paper
+      # the URL names, so the agent cannot act on another paper.
+      - assert_field_equal: {left: url_paper_id, right: page_paper_id}
+      # Before "Decline Submission": the paper's files are shown, the button is there,
+      # and the decision source (a spreadsheet or service holding the editors'
+      # decisions) still says to decline it.
+      - trigger: {click_text: [Decline Submission]}
+        require_page_text: {values: [Submission Files]}
+      - trigger: {click_text: [Decline Submission]}
+        assert_compare: {left: decline_buttons, op: ">=", value: 1}
+      - trigger: {click_text: [Decline Submission]}
+        ojs_decision: {paper_field: url_paper_id}
+      # Before "Record Editorial Decision": the decline form is open, the email is long
+      # enough and is the one the decision source has for this paper. The agent types a
+      # "Regarding submission N:" line (about 26 characters) before its email of at least
+      # 20 (MIN_EMAIL_CHARS), so the editor must hold at least 50.
+      - trigger: {click_text: [Record Editorial Decision]}
+        assert_compare: {left: record_buttons, op: ">=", value: 1}
+      - trigger: {click_text: [Record Editorial Decision]}
+        assert_compare: {left: decline_email_length, op: ">=", value: 50}
+      - trigger: {click_text: [Record Editorial Decision]}
+        ojs_decision: {paper_field: url_paper_id, email_field: decline_email}
+    post_conditions:
+      # After "Decline Submission": the decline form opened, with its email editor.
+      - trigger: {click_text: [Decline Submission]}
+        assert_compare: {left: decline_modals, op: ">=", value: 1}
+      - trigger: {click_text: [Decline Submission]}
+        assert_compare: {left: email_editors, op: ">=", value: 1}
+      # After "Record Editorial Decision": recorded. The form closed, the Decline button
+      # is gone, and the paper shows as declined.
+      - trigger: {click_text: [Record Editorial Decision]}
+        assert_compare: {left: decline_modals, op: "==", value: 0}
+      - trigger: {click_text: [Record Editorial Decision]}
+        assert_compare: {left: decline_buttons, op: "==", value: 0}
+      - trigger: {click_text: [Record Editorial Decision]}
+        require_page_text: {values: [Declined]}

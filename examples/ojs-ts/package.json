@@ -1,0 +1,20 @@
+{
+  "name": "statelock-ojs-ts-example",
+  "private": true,
+  "type": "module",
+  "description": "The OJS screening agent in TypeScript on Stagehand v3, through Statelock.",
+  "scripts": {
+    "start": "tsx ojs_agent.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@browserbasehq/stagehand": "3.7.3",
+    "@statelock/client": "file:../../js",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
