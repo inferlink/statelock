@@ -41,13 +41,14 @@ def _failing_chromium(tmp_path: Path, message: str) -> Path:
 
 def _answering_chromium(tmp_path: Path, *, ignore_term: bool = False) -> Path:
     """Answers every CDP command on the pipe (fds 3 and 4), as Chromium does; writes its pid,
-    arguments and environment; starts a helper process, as Chromium does."""
+    arguments and environment; starts a helper process, as Chromium does. With ignore_term it
+    is a hung browser: it ignores SIGTERM and stays up after its pipe closes."""
     return _script(
         tmp_path,
         f"#!{sys.executable}\n"
         + textwrap.dedent(
             f"""
-            import json, os, signal, subprocess, sys
+            import json, os, signal, subprocess, sys, time
             if {ignore_term!r}:
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)
             helper = subprocess.Popen(["sleep", "60"], pass_fds=())
@@ -60,6 +61,8 @@ def _answering_chromium(tmp_path: Path, *, ignore_term: bool = False) -> Path:
                     raw, data = data.split(b"\\0", 1)
                     message = json.loads(raw)
                     os.write(4, json.dumps({{"id": message["id"], "result": {{}}}}).encode() + b"\\0")
+            while {ignore_term!r}:  # a hung browser: stays up after its pipe closes, until SIGKILL
+                time.sleep(1)
             """
         ),
     )
