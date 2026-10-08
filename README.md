@@ -1,6 +1,6 @@
 # Statelock
 
-Statelock adds policy checks and evidence to AI browser automation. It is a Chrome DevTools Protocol (CDP) proxy between your agent (Playwright, browser-use, Stagehand, LangChain or any CDP client) and a headless Chromium.
+Statelock adds policy checks and evidence to AI browser automations. It is a Chrome DevTools Protocol (CDP) proxy between your agent (Playwright, browser-use, Stagehand, LangChain or any CDP client) and a headless Chromium.
 
 Before each click, keystroke, upload or download, Statelock captures the page and checks your policy, then releases or blocks the action. After a commit action it checks post-conditions. It records evidence for every decision.
 
