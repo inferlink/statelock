@@ -117,10 +117,10 @@ def test_different_values_are_not_equal(left: str, right: str) -> None:
     assert not values_equal(left, right)
 
 
-def test_currency_codes_and_nonfinite_amounts_fail_comparison() -> None:
+def test_currency_codes_and_long_amounts_compare_exactly() -> None:
     assert not values_equal("USD 5,000", "EUR 5,000")
-    assert parse_number("9" * 500) is None
-    assert not values_equal("9" * 500, "8" * 500)
+    assert parse_number("9" * 500) == int("9" * 500)
+    assert not values_equal("9" * 500, "9" * 499 + "8")
 
 
 def test_prohibited_text_capture_limit_fails_closed() -> None:

@@ -3,26 +3,25 @@
 
 from __future__ import annotations
 
-import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from statelock.core.actions import CdpAction
+from statelock.core.actions import ActionKind, CdpAction
 from statelock.core.enums import TargetSelection
 
 SECRET_AUTOCOMPLETE = {"current-password", "new-password", "one-time-code", "cc-number", "cc-csc", "cc-exp"}
 
 
-def normalized_label(value: str) -> str:
-    text = unicodedata.normalize("NFKC", value).casefold()
-    text = "".join(char for char in text if unicodedata.category(char) != "Cf")
-    return " ".join(text.split())
-
-
 class TargetElement(BaseModel):
-    """The element that receives an action: under the pointer, or focused."""
+    """The element that receives an action: under the pointer, or focused.
+
+    ``unresolved``: the action goes into a frame Statelock cannot read (out of process or
+    cross-origin); the element described is the frame's owner (e.g. the IFRAME). Its label
+    is unknown, so it counts as an interactive element with no readable label, which
+    click-text rules block and click-text triggers match.
+    """
 
     model_config = ConfigDict(extra="allow")
 
@@ -40,6 +39,8 @@ class TargetElement(BaseModel):
     y: float | None = None
     width: float | None = None
     height: float | None = None
+    unresolved: bool = False
+    frame_url: str | None = None  # the unresolved frame's src
 
     @property
     def is_secret_input(self) -> bool:
@@ -49,17 +50,16 @@ class TargetElement(BaseModel):
 
     @property
     def label_text(self) -> str:
-        """Visible text and aria-label, used for text-matching rules."""
+        """Visible text and aria-label, used for text-matching rules (empty when unresolved)."""
+        if self.unresolved:
+            return ""
         return " ".join(part.strip() for part in (self.text or "", self.aria_label or "") if part and part.strip())
-
-    @property
-    def normalized_label(self) -> str:
-        return normalized_label(self.label_text)
 
     @property
     def is_interactive(self) -> bool:
         return (
-            (self.tag_name or "").upper() in {"BUTTON", "A", "SUMMARY"}
+            self.unresolved
+            or (self.tag_name or "").upper() in {"BUTTON", "A", "SUMMARY"}
             or ((self.tag_name or "").upper() == "INPUT" and self.input_type in {"button", "submit", "reset", "image"})
             or (self.role or "").casefold() in {"button", "link", "menuitem"}
         )
@@ -74,6 +74,8 @@ class BrowserState(BaseModel):
     target_element: TargetElement | None = None
     page_text: str | None = None
     page_text_truncated: bool = False
+    # Shown parts of the page whose text could not be read (cross-origin frames, by src).
+    page_text_unread: list[str] = Field(default_factory=list)
     extracted_fields: dict[str, Any] = Field(default_factory=dict)
     accessibility_tree: dict[str, Any] = Field(default_factory=dict)
     viewport: dict[str, Any] = Field(default_factory=dict)
@@ -89,7 +91,7 @@ class ActionContext(BaseModel):
     tenant_id: str | None = None
     sequence: int
     method: str
-    action_kind: str
+    action_kind: ActionKind
     params: dict[str, Any] = Field(default_factory=dict)
     cdp_message_id: int | None = None
     cdp_session_id: str | None = None
@@ -117,7 +119,7 @@ class ActionContext(BaseModel):
             tenant_id=tenant_id,
             sequence=sequence,
             method=action.method,
-            action_kind=action.kind.value,
+            action_kind=action.kind,
             params=action.params,
             cdp_message_id=action.message_id,
             cdp_session_id=action.session_id,
@@ -132,7 +134,7 @@ class ActionContext(BaseModel):
             "agent_id": self.agent_id,
             "sequence": self.sequence,
             "method": self.method,
-            "action_kind": self.action_kind,
+            "action_kind": self.action_kind.value,
             "params": self.params,
             "browser_url": state.url if state else None,
             "browser_title": state.title if state else None,

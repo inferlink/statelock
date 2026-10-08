@@ -13,7 +13,7 @@ The agent then sends ``DOM.setFileInputFiles`` with the returned paths. That
 command is a governed action (state capture, pre-conditions, record), and it
 may only name files uploaded in the same session, so an agent cannot attach
 other files from the Statelock host. The client SDK wraps all of this in
-``StatelockConnection.set_input_files``. Files are deleted when the session ends.
+``statelock.client.set_input_files``. Files are deleted when the session ends.
 """
 
 from __future__ import annotations
@@ -29,13 +29,11 @@ from pathlib import Path
 from typing import Any
 
 from statelock.proxy.files import ByteBudget, LocalCommandError, SessionFolder
+from statelock.wire import UPLOAD_BEGIN_COMMAND, UPLOAD_CHUNK_COMMAND, UPLOAD_END_COMMAND
 
 logger = logging.getLogger(__name__)
 
-BEGIN_METHOD = "Statelock.uploadFileBegin"
-CHUNK_METHOD = "Statelock.uploadFileChunk"
-END_METHOD = "Statelock.uploadFileEnd"
-COMMANDS = frozenset({BEGIN_METHOD, CHUNK_METHOD, END_METHOD})
+COMMANDS = frozenset({UPLOAD_BEGIN_COMMAND, UPLOAD_CHUNK_COMMAND, UPLOAD_END_COMMAND})
 MAX_NAME_LENGTH = 255
 MAX_PENDING_UPLOADS = 16
 
@@ -98,12 +96,12 @@ class SessionUploads:
 
     def handle(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """Run one Statelock.uploadFile* command. Raises UploadError."""
-        if method == BEGIN_METHOD:
+        if method == UPLOAD_BEGIN_COMMAND:
             return self.begin(params.get("name"), params.get("mimeType"))
-        if method == CHUNK_METHOD:
+        if method == UPLOAD_CHUNK_COMMAND:
             self.chunk(params.get("uploadId"), params.get("data"))
             return {}
-        if method == END_METHOD:
+        if method == UPLOAD_END_COMMAND:
             return self.end(params.get("uploadId")).as_wire()
         raise UploadError(f"unknown Statelock command: {method}")
 
@@ -174,7 +172,7 @@ class SessionUploads:
             if uploaded is None:
                 raise UploadError(
                     f"{path} was not uploaded in this Statelock session. Upload files with "
-                    "StatelockConnection.set_input_files (or the Statelock.uploadFile* commands) first."
+                    "statelock.client.set_input_files (or the Statelock.uploadFile* commands) first."
                 )
             resolved.append(uploaded)
         return resolved

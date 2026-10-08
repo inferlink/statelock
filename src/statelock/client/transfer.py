@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""What the async (files.py, install.py) and sync (sync.py) clients share: the
-Statelock upload, download and session protocol, and Playwright patching.
+"""The Statelock upload, download and session protocol, shared by the async
+(files.py) and sync (files_sync.py) clients.
 
 The protocol is written once, as generators of steps (``Command``, ``Sleep``,
 ``Write``) that receive each command's result. Each client only adds its
@@ -22,17 +22,24 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import mimetypes
 import os
 import tempfile
 import time
 import uuid
-from collections.abc import Generator, Iterable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Generic, TypeVar
 
-from statelock.wire import SESSION_COMMAND
+from statelock.client.violations import StatelockPolicyViolationError
+from statelock.wire import (
+    DOWNLOAD_READ_COMMAND,
+    DOWNLOADS_COMMAND,
+    SESSION_COMMAND,
+    UPLOAD_BEGIN_COMMAND,
+    UPLOAD_CHUNK_COMMAND,
+    UPLOAD_END_COMMAND,
+)
 
 # Per CDP message; stays well under uvicorn's 16 MiB WebSocket message limit.
 CHUNK_BYTES = 4 * 1024 * 1024
@@ -46,6 +53,54 @@ UNKNOWN_COMMAND_TEXT = "wasn't found"
 UploadFile = str | Path | dict[str, Any]
 FilePayload = tuple[str, str | None, bytes]
 T = TypeVar("T")
+D = TypeVar("D")
+
+# The upload's MIME type by file extension, the same table as the JS SDK's (js/src/mime.ts),
+# so upload evidence does not depend on the SDK or on the machine's MIME database.
+# Other extensions upload with no type.
+MIME_TYPES = {
+    ".7z": "application/x-7z-compressed",
+    ".bmp": "image/bmp",
+    ".csv": "text/csv",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".eml": "message/rfc822",
+    ".epub": "application/epub+zip",
+    ".gif": "image/gif",
+    ".gz": "application/gzip",
+    ".heic": "image/heic",
+    ".htm": "text/html",
+    ".html": "text/html",
+    ".ics": "text/calendar",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".js": "text/javascript",
+    ".json": "application/json",
+    ".md": "text/markdown",
+    ".mp3": "audio/mpeg",
+    ".mp4": "video/mp4",
+    ".odp": "application/vnd.oasis.opendocument.presentation",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".rtf": "application/rtf",
+    ".svg": "image/svg+xml",
+    ".tar": "application/x-tar",
+    ".tex": "application/x-tex",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".tsv": "text/tab-separated-values",
+    ".txt": "text/plain",
+    ".wav": "audio/wav",
+    ".webp": "image/webp",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xml": "application/xml",
+    ".zip": "application/zip",
+}
 
 
 class StatelockDownloadError(Exception):
@@ -60,9 +115,14 @@ class DownloadBlocked(Exception):
         self.item = item
 
 
-def blocked_violation(blocked: DownloadBlocked, session_id: str | None) -> dict[str, Any]:
-    """What a client knows about a blocked download; statelock_guard adds the recorded violation."""
-    return {"rule": "download", "reason": str(blocked), "session_id": session_id}
+def blocked_violation(blocked: DownloadBlocked, session_id: str | None) -> StatelockPolicyViolationError:
+    """What a client knows about a blocked download: the rule Statelock reports in the
+    download entry (None if it gives none) and the reason. The guards complete it with
+    the recorded violation."""
+    rule = blocked.item.get("rule")
+    return StatelockPolicyViolationError(
+        {"rule": rule if isinstance(rule, str) else None, "reason": str(blocked), "session_id": session_id}
+    )
 
 
 # Steps --------------------------------------------------------------------------------------
@@ -115,17 +175,27 @@ def upload_items(files: UploadFile | Sequence[UploadFile]) -> list[UploadFile]:
     return [files] if isinstance(files, (str, Path, dict)) else list(files)
 
 
+def buffer_bytes(buffer: Any) -> bytes:
+    """A FilePayload's ``buffer``: bytes-like as is, text as UTF-8. Anything else (or no
+    buffer) is refused rather than uploaded as its ``str()``, or as an empty file."""
+    if isinstance(buffer, (bytes, bytearray, memoryview)):
+        return bytes(buffer)
+    if isinstance(buffer, str):
+        return buffer.encode("utf-8")
+    raise TypeError(f"set_input_files: buffer must be bytes or str, not {type(buffer).__name__}")
+
+
+def mime_type(name: str) -> str | None:
+    """The MIME type for a file name (MIME_TYPES), None for other extensions."""
+    return MIME_TYPES.get(Path(name).suffix.lower())
+
+
 def file_payload(item: UploadFile) -> FilePayload:
     """(name, mime type, bytes) of one file to upload."""
     if isinstance(item, dict):
-        buffer = item.get("buffer")
-        if isinstance(buffer, (bytes, bytearray, memoryview)):
-            data = bytes(buffer)
-        else:
-            data = str(buffer or "").encode("utf-8")
-        return str(item["name"]), item.get("mimeType"), data
+        return str(item["name"]), item.get("mimeType"), buffer_bytes(item.get("buffer"))
     path = Path(item)
-    return path.name, mimetypes.guess_type(path.name)[0], path.read_bytes()
+    return path.name, mime_type(path.name), path.read_bytes()
 
 
 def file_payloads(files: UploadFile | Sequence[UploadFile]) -> list[FilePayload]:
@@ -143,10 +213,10 @@ def upload_steps(payloads: Iterable[FilePayload]) -> Steps[list[dict[str, Any]]]
     """Stream the files to Statelock. Returns what it stored (path, name, size, sha256, mimeType)."""
     uploaded = []
     for name, mime_type, data in payloads:
-        begun = yield Command("Statelock.uploadFileBegin", {"name": name, "mimeType": mime_type})
+        begun = yield Command(UPLOAD_BEGIN_COMMAND, {"name": name, "mimeType": mime_type})
         for chunk in upload_chunks(data):
-            yield Command("Statelock.uploadFileChunk", {"uploadId": begun["uploadId"], "data": chunk})
-        uploaded.append(dict((yield Command("Statelock.uploadFileEnd", {"uploadId": begun["uploadId"]}))))
+            yield Command(UPLOAD_CHUNK_COMMAND, {"uploadId": begun["uploadId"], "data": chunk})
+        uploaded.append(dict((yield Command(UPLOAD_END_COMMAND, {"uploadId": begun["uploadId"]}))))
     return uploaded
 
 
@@ -257,18 +327,52 @@ def first_new_download(entries: Iterable[dict[str, Any]], known: set[Any]) -> Do
 
 def known_downloads_steps() -> Steps[set[Any]]:
     """The guids Statelock already has: the download to wait for is the next one."""
-    return {d.get("guid") for d in download_entries((yield Command("Statelock.downloads")))}
+    return {d.get("guid") for d in download_entries((yield Command(DOWNLOADS_COMMAND)))}
 
 
 def wait_for_download_steps(known: set[Any], timeout: float) -> Steps[DownloadInfo]:
     """Poll until a download not in known completes. Raises DownloadBlocked if Statelock blocked it."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        info = first_new_download(download_entries((yield Command("Statelock.downloads"))), known)
+        info = first_new_download(download_entries((yield Command(DOWNLOADS_COMMAND))), known)
         if info is not None:
             return info
         yield Sleep(DOWNLOAD_POLL_INTERVAL)
     raise StatelockDownloadError(f"no download completed within {timeout} s")
+
+
+def expect_download_steps(
+    known: set[Any], timeout: float, accept: Callable[[DownloadInfo], D | None], session_id: str | None
+) -> Steps[D]:
+    """Wait for the first new download ``accept`` takes: it returns the download to hand
+    over, or None to skip that one. ``timeout`` is in seconds for all of them together.
+    A download Statelock blocked raises StatelockPolicyViolationError (blocked_violation)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            info = yield from wait_for_download_steps(known, max(0.0, deadline - time.monotonic()))
+        except DownloadBlocked as blocked:
+            raise blocked_violation(blocked, session_id) from None
+        chosen = accept(info)
+        if chosen is not None:
+            return chosen
+        known.add(info.guid)
+
+
+class Waiter(Generic[D]):
+    """What expect_download yields: the download, once the block has ended."""
+
+    def __init__(self) -> None:
+        self._value: D | None = None
+
+    def resolve(self, value: D) -> None:
+        """Hand over the download (expect_download does this after the block)."""
+        self._value = value
+
+    def result(self) -> D:
+        if self._value is None:
+            raise RuntimeError("the download is only available after the expect_download block has ended")
+        return self._value
 
 
 def read_request(guid: str, offset: int) -> dict[str, Any]:
@@ -299,17 +403,19 @@ def read_steps(info: DownloadInfo) -> Steps[None]:
     """Stream a checked download in chunks (``Write``), verifying its SHA-256 at the end."""
     check = DigestCheck(info)
     while True:
-        data, last = check.chunk((yield Command("Statelock.downloadRead", read_request(info.guid, check.offset))))
+        data, last = check.chunk((yield Command(DOWNLOAD_READ_COMMAND, read_request(info.guid, check.offset))))
         yield Write(data)
         if last:
             break
     check.verify()
 
 
-def download_timeout_seconds(timeout_ms: float | None) -> float:
-    """Playwright's timeout (ms; None: the default; 0: none) in seconds."""
-    timeout = DEFAULT_DOWNLOAD_TIMEOUT_MS if timeout_ms is None else timeout_ms
-    return timeout / 1000 if timeout > 0 else float("inf")
+def download_timeout_seconds(timeout_ms: float | None, default_ms: float | None = None) -> float:
+    """Playwright's timeout in seconds: ``timeout_ms``, else the page's default
+    (``default_ms``, from set_default_timeout), else 30 s; 0 means no limit."""
+    if timeout_ms is None:
+        timeout_ms = DEFAULT_DOWNLOAD_TIMEOUT_MS if default_ms is None else default_ms
+    return timeout_ms / 1000 if timeout_ms > 0 else float("inf")
 
 
 def temporary_path(name: str) -> Path:
@@ -318,31 +424,3 @@ def temporary_path(name: str) -> Path:
     handle, path = tempfile.mkstemp(prefix="statelock-", suffix=f"-{Path(name).name}")
     os.close(handle)
     return Path(path)
-
-
-# Patching -----------------------------------------------------------------------------------
-
-
-Patch = tuple[type, str, Any]
-
-
-class Patches:
-    """Replace Playwright methods, keeping the originals (install is idempotent)."""
-
-    def __init__(self, patches: Sequence[Patch]) -> None:
-        self._patches = patches
-        self._originals: dict[tuple[type, str], Any] = {}
-
-    def original(self, cls: type, name: str) -> Any:
-        return self._originals[(cls, name)]
-
-    def install(self) -> None:
-        for cls, name, replacement in self._patches:
-            if (cls, name) not in self._originals:
-                self._originals[(cls, name)] = getattr(cls, name)
-                setattr(cls, name, replacement)
-
-    def uninstall(self) -> None:
-        for (cls, name), original in list(self._originals.items()):
-            setattr(cls, name, original)
-            del self._originals[(cls, name)]

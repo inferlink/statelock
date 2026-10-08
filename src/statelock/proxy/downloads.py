@@ -17,10 +17,12 @@ A blocked download is cancelled (or deleted) and ends the session, like any
 violation. The file reaches the agent only after both checks pass, over the
 agent's own CDP connection:
 
-- ``Statelock.downloads`` {} -> {downloads: [{guid, name, url, state, size, sha256, reason}]}
+- ``Statelock.downloads`` {} -> {downloads: [{guid, name, url, state, size, sha256, reason, rule}]}
+  (``rule``: for a blocked download, the policy rule that blocked it, or ``download_limit``
+  for a size limit; null when allowed or when a check could not run)
 - ``Statelock.downloadRead`` {guid, offset, length} -> {data (base64), eof}
 
-The client SDK wraps this in ``StatelockConnection.expect_download``. Files are
+The client SDK wraps this in ``statelock.client.expect_download``. Files are
 deleted when the session ends.
 """
 
@@ -32,43 +34,56 @@ import hashlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
+from statelock.core.enums import SystemRule
 from statelock.core.jsonutil import as_dict, as_str
+from statelock.proxy.connection import CdpError
 from statelock.proxy.files import ByteBudget, LocalCommandError, SessionFolder
 from statelock.proxy.tasks import BackgroundTasks
+from statelock.wire import DOWNLOAD_READ_COMMAND, DOWNLOADS_COMMAND
 
 logger = logging.getLogger(__name__)
 
-LIST_METHOD = "Statelock.downloads"
-READ_METHOD = "Statelock.downloadRead"
-COMMANDS = frozenset({LIST_METHOD, READ_METHOD})
+COMMANDS = frozenset({DOWNLOADS_COMMAND, DOWNLOAD_READ_COMMAND})
 AGENT_BEHAVIOR_METHODS = {"Browser.setDownloadBehavior", "Page.setDownloadBehavior"}
 MAX_READ_BYTES = 4 * 1024 * 1024
 HASH_BLOCK_BYTES = 1024 * 1024
 
-# States reported to the agent.
-IN_PROGRESS = "in_progress"
-CHECKING = "checking"  # finished downloading; completion checks running
-COMPLETED = "completed"  # passed every check; the agent may read it
-BLOCKED = "blocked"
-CANCELED = "canceled"
+
+class DownloadState(str, Enum):
+    """A download's state, as reported to the agent."""
+
+    IN_PROGRESS = "in_progress"
+    CHECKING = "checking"  # finished downloading; completion checks running
+    COMPLETED = "completed"  # passed every check; the agent may read it
+    BLOCKED = "blocked"
+    CANCELED = "canceled"
 
 
 class DownloadError(LocalCommandError):
     """A download command the proxy rejects. The message goes back to the agent."""
 
 
-class DownloadPolicy(Protocol):
-    """The checks a download goes through. Implemented by the session's ActionGovernor."""
+@dataclass(frozen=True)
+class DownloadCheck:
+    """The outcome of a download check: allowed, or the rule that blocked it."""
 
-    async def download_begin(self, params: dict[str, Any], frame_id: str | None) -> tuple[bool, str | None]:
-        """Govern a download that began. Returns (allowed, the page URL it began on)."""
+    allowed: bool
+    rule: str | None = None
+
+
+class DownloadPolicy(Protocol):
+    """The checks a download goes through (the session's SessionDownloadPolicy, proxy/download_policy.py)."""
+
+    async def download_begin(self, params: dict[str, Any], frame_id: str | None) -> tuple[DownloadCheck, str | None]:
+        """Govern a download that began. Returns (the check, the page URL it began on)."""
         ...
 
-    async def download_complete(self, params: dict[str, Any], begin_url: str | None) -> bool:
-        """Govern a finished download. Returns allowed."""
+    async def download_complete(self, params: dict[str, Any], begin_url: str | None) -> DownloadCheck:
+        """Govern a finished download."""
         ...
 
     async def download_limit(self, reason: str, params: dict[str, Any]) -> None:
@@ -87,10 +102,11 @@ class DownloadInfo:
     frame_id: str | None
     browser_context_id: str | None
     page_url: str | None = None
-    state: str = IN_PROGRESS
+    state: DownloadState = DownloadState.IN_PROGRESS
     size: int | None = None
     sha256: str | None = None
     reason: str | None = None
+    rule: str | None = None  # the rule that blocked it
     reserved_bytes: int = 0
     begun: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -99,10 +115,11 @@ class DownloadInfo:
             "guid": self.guid,
             "name": self.name,
             "url": self.url,
-            "state": self.state,
+            "state": self.state.value,
             "size": self.size,
             "sha256": self.sha256,
             "reason": self.reason,
+            "rule": self.rule,
         }
 
 
@@ -208,7 +225,7 @@ class SessionDownloads:
             "url": info.url,
             "suggested_filename": info.name,
             "download_count": len(self._downloads),
-            "state": info.state,
+            "state": info.state.value,
         }
         for key in ("size", "sha256", "reason"):
             value = getattr(info, key)
@@ -229,12 +246,12 @@ class SessionDownloads:
         )
         self._downloads[guid] = info
         try:
-            allowed, info.page_url = await self._policy.download_begin(self._params(info, "begin"), info.frame_id)
+            check, info.page_url = await self._policy.download_begin(self._params(info, "begin"), info.frame_id)
         except Exception:
             logger.exception("Download begin check failed for %s", info.name)
-            allowed = False
-        if not allowed:
-            await self._reject(info, "blocked by policy when the download began")
+            check = DownloadCheck(allowed=False)
+        if not check.allowed:
+            await self._reject(info, "blocked by policy when the download began", check.rule)
         info.begun.set()
 
     async def _progress(self, params: dict[str, Any]) -> None:
@@ -247,20 +264,20 @@ class SessionDownloads:
             await self._check_limits(info, int(received))
             return
         await info.begun.wait()
-        if info.state == BLOCKED:
+        if info.state == DownloadState.BLOCKED:
             self._delete(info)  # it may have finished before the cancel took effect
-        elif state == "canceled" and info.state == IN_PROGRESS:
-            info.state = CANCELED
+        elif state == "canceled" and info.state == DownloadState.IN_PROGRESS:
+            info.state = DownloadState.CANCELED
             self._delete(info)
-        elif state == "completed" and info.state == IN_PROGRESS:
+        elif state == "completed" and info.state == DownloadState.IN_PROGRESS:
             await self._complete(info)
 
     async def _limit(self, info: DownloadInfo, reason: str, phase: str) -> None:
-        await self._reject(info, reason)
+        await self._reject(info, reason, SystemRule.DOWNLOAD_LIMIT.value)
         await self._policy.download_limit(reason, self._params(info, phase))
 
     async def _check_limits(self, info: DownloadInfo, received: int) -> None:
-        if info.state != IN_PROGRESS:
+        if info.state != DownloadState.IN_PROGRESS:
             return
         problem = self.budget.violation(received)
         if problem is not None:
@@ -280,24 +297,25 @@ class SessionDownloads:
         # Reserve before any await, so concurrent completions cannot overrun the session budget.
         self.budget.reserve(size)
         info.reserved_bytes = size
-        info.state = CHECKING
+        info.state = DownloadState.CHECKING
         try:
-            allowed = await self._policy.download_complete(self._params(info, "complete"), info.page_url)
+            check = await self._policy.download_complete(self._params(info, "complete"), info.page_url)
         except Exception:
             logger.exception("Download completion check failed for %s", info.name)
-            allowed = False
-        if not allowed:
-            await self._reject(info, "blocked by policy when the download completed")
+            check = DownloadCheck(allowed=False)
+        if not check.allowed:
+            await self._reject(info, "blocked by policy when the download completed", check.rule)
             return
-        info.state = COMPLETED
+        info.state = DownloadState.COMPLETED
         logger.info("Download %s completed (%d bytes, sha256=%s)", info.name, size, digest)
 
-    async def _reject(self, info: DownloadInfo, reason: str) -> None:
-        if info.state == BLOCKED:
+    async def _reject(self, info: DownloadInfo, reason: str, rule: str | None = None) -> None:
+        if info.state == DownloadState.BLOCKED:
             return
-        was_in_progress = info.state == IN_PROGRESS
-        info.state = BLOCKED
+        was_in_progress = info.state == DownloadState.IN_PROGRESS
+        info.state = DownloadState.BLOCKED
         info.reason = reason
+        info.rule = rule
         self.budget.release(info.reserved_bytes)
         info.reserved_bytes = 0
         if was_in_progress:
@@ -306,7 +324,7 @@ class SessionDownloads:
                 params["browserContextId"] = info.browser_context_id
             try:
                 await self._send("Browser.cancelDownload", params)
-            except Exception as error:  # noqa: BLE001 - already finished; the file is deleted below
+            except CdpError as error:  # already finished; the file is deleted below
                 logger.debug("cancelDownload failed for %s: %s", info.guid, error)
         self._delete(info)
         logger.warning("Download %s blocked: %s", info.name, reason)
@@ -321,9 +339,9 @@ class SessionDownloads:
 
         Runs on the event loop (the download table changes there); only file reads use a thread.
         """
-        if method == LIST_METHOD:
+        if method == DOWNLOADS_COMMAND:
             return {"downloads": [info.public() for info in self._downloads.values()]}
-        if method == READ_METHOD:
+        if method == DOWNLOAD_READ_COMMAND:
             return await self.read(params.get("guid"), params.get("offset", 0), params.get("length", MAX_READ_BYTES))
         raise DownloadError(f"unknown Statelock command: {method}")
 
@@ -331,8 +349,8 @@ class SessionDownloads:
         info = self._downloads.get(guid) if isinstance(guid, str) else None
         if info is None:
             raise DownloadError(f"unknown download: {guid!r}")
-        if info.state != COMPLETED:
-            raise DownloadError(f"download {info.name} is not available (state={info.state})")
+        if info.state != DownloadState.COMPLETED:
+            raise DownloadError(f"download {info.name} is not available (state={info.state.value})")
         if not isinstance(offset, int) or offset < 0 or not isinstance(length, int) or length <= 0:
             raise DownloadError("offset and length must be non-negative integers")
         try:

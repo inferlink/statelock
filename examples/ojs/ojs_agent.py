@@ -11,7 +11,8 @@ cancelled. Set OJS_RECORD_DECISIONS=1 to record.
 
 Stagehand finds elements with an LLM when the fixed OJS selectors miss (set a
 model key to enable it). The agent is ordinary Stagehand and Playwright code; the
-Statelock part is three lines in main() (marked "Statelock"). Every click, key
+Statelock part is three lines in open_session() and run_governed() (marked
+"Statelock"). Every click, key
 press and download then goes through Statelock.
 
 The agent never has the password. It types the placeholder {{secret:ojs_password}}
@@ -30,6 +31,7 @@ Environment:
   OJS_DECISIONS_FILE      JSON: {"<paper id>": {"reject": true, "email": "..."}} (optional)
   OJS_RECORD_DECISIONS    1 to record declines (sends the email); default: dry run
   OJS_OUTPUT_DIR          where manuscripts and results.json go (default ./ojs-output)
+  OJS_ACTION_TIMEOUT      seconds an action may take, including a wait for review (default 360)
   OJS_DEMO_PROHIBITED_CLICK  demo only: after logging in, click this workflow button on the
                           first paper (for example "Send to Review") to show Statelock blocking it
   STAGEHAND_MODEL, MODEL_API_KEY   optional: the LLM for Stagehand's observe()
@@ -45,9 +47,10 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlparse
 
 from playwright.async_api import Locator
@@ -55,14 +58,25 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from stagehand import ObserveResult, Stagehand, StagehandConfig
 
 import statelock.client
-from statelock.client import StatelockPolicyViolationError, create_session_url
+from statelock.client import SessionUrl, StatelockPolicyViolationError, create_session_url
 
 logger = logging.getLogger("ojs_agent")
+T = TypeVar("T")
 
 PAPER_ID_RE = re.compile(r"/(?:workflow/(?:access|index)|authorDashboard/submission)/(\d+)")
 # The mock journal: on this machine, or the compose demo's ojs-mock service.
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "host.docker.internal", "ojs-mock"}
-MIN_EMAIL_CHARS = 20
+# Actions paused for review (policy rules with on_fail: review) wait for a person.
+DEFAULT_ACTION_TIMEOUT_S = 360.0
+
+
+def xpath_literal(text: str) -> str:
+    """An XPath string literal for any text (a quote in it would end a '...' literal)."""
+    if "'" not in text:
+        return f"'{text}'"
+    if '"' not in text:
+        return f'"{text}"'
+    return "concat('" + "', \"'\", '".join(text.split("'")) + "')"
 
 
 @dataclass
@@ -77,6 +91,7 @@ class AgentSettings:
     model_name: str | None
     model_api_key: str | None = field(repr=False)
     demo_prohibited_click: str | None = None
+    action_timeout_s: float = DEFAULT_ACTION_TIMEOUT_S
 
     @classmethod
     def from_env(cls) -> AgentSettings:
@@ -92,6 +107,7 @@ class AgentSettings:
             model_name=os.getenv("STAGEHAND_MODEL"),
             model_api_key=os.getenv("MODEL_API_KEY"),
             demo_prohibited_click=os.getenv("OJS_DEMO_PROHIBITED_CLICK") or None,
+            action_timeout_s=float(os.getenv("OJS_ACTION_TIMEOUT") or DEFAULT_ACTION_TIMEOUT_S),
         )
         host = urlparse(settings.base_url).hostname or ""
         if host not in LOCAL_HOSTS and os.getenv("OJS_ALLOW_REMOTE") != "1":
@@ -147,7 +163,7 @@ class OjsAgent:
         if await locator.count() and await locator.is_visible():
             return locator
         if self.settings.ai_enabled:
-            results = await self.stagehand.page.observe(instruction)
+            results = await self.page.observe(instruction)
             if results:
                 logger.info("observe() found %r for: %s", results[0].selector, instruction)
                 return self.page.locator(results[0].selector).first
@@ -192,13 +208,13 @@ class OjsAgent:
         paper_id = (await self.active_submission_ids())[0]
         await self.open_submission(paper_id)
         logger.warning("Demo: clicking %r on paper %s, a button the policy prohibits", text, paper_id)
-        selector = f"xpath=//a[normalize-space()={text!r}]"
+        selector = f"xpath=//a[normalize-space()={xpath_literal(text)}]"
         button = ObserveResult(selector=selector, description=text, method="click", arguments=[])
         browser = self.page.context.browser
         closed = asyncio.Event()
         if browser is not None:
             browser.once("disconnected", lambda _browser: closed.set())
-        await self.stagehand.page.act(button)  # Stagehand's click (el.click()), replayed and checked by Statelock
+        await self.page.act(button)  # Stagehand's click (el.click()), replayed and checked by Statelock
         # Statelock ends the session: wait for that, not a fixed delay.
         with contextlib.suppress(asyncio.TimeoutError, TimeoutError):
             await asyncio.wait_for(closed.wait(), timeout=10)
@@ -279,8 +295,9 @@ class OjsAgent:
 
     async def decline(self, screening: Screening, email: str) -> None:
         paper_id = screening.paper_id
-        if len(email.strip()) < MIN_EMAIL_CHARS:
-            raise ValueError(f"Paper {paper_id}: decline email is too short")
+        # Only a basic check: Statelock checks the length and that it is the decided email.
+        if not email.strip():
+            raise ValueError(f"Paper {paper_id}: no decline email")
         await self.open_submission(paper_id)
         await (await self.find("a[id^='decline-button-']", "the Decline Submission button")).click()
         editor = self.page.frame_locator("iframe[id*='personalMessage'], iframe[id$='_ifr']").first.locator("body")
@@ -345,25 +362,35 @@ async def start_stagehand(settings: AgentSettings, browser_url: str) -> Stagehan
     return stagehand
 
 
+def open_session(settings: AgentSettings, server_url: str | None = None, api_key: str | None = None) -> SessionUrl:
+    """Statelock: a one-time browser URL (STATELOCK_URL, STATELOCK_API_KEY), with the saved login (blocking)."""
+    return create_session_url(
+        server_url, api_key=api_key, saved_session=settings.saved_session, save_session=bool(settings.saved_session)
+    )
+
+
+async def run_governed(settings: AgentSettings, session: SessionUrl, steps: Callable[[OjsAgent], Awaitable[T]]) -> T:
+    """Run ``steps`` (OjsAgent.run for the full agent) with ordinary Stagehand on the
+    session's browser. A Statelock violation raises StatelockPolicyViolationError."""
+    statelock.client.install()  # Statelock: Playwright's own uploads and downloads go through Statelock
+    stagehand = await start_stagehand(settings, session.cdp_url)
+    stagehand.page.context.set_default_timeout(settings.action_timeout_s * 1000)
+    try:
+        async with session.guard():  # Statelock (optional): a violation raises StatelockPolicyViolationError
+            return await steps(OjsAgent(settings, stagehand))
+    finally:
+        await stagehand.close()
+
+
 async def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     settings = AgentSettings.from_env()
-    statelock.client.install()  # Statelock: Playwright's own uploads and downloads go through Statelock
-    # Statelock: a one-time browser URL (STATELOCK_URL, STATELOCK_API_KEY), with the saved login.
-    session = await asyncio.to_thread(  # a blocking HTTP call: off the event loop
-        create_session_url, saved_session=settings.saved_session, save_session=bool(settings.saved_session)
-    )
-    stagehand = await start_stagehand(settings, session.cdp_url)
-    # Actions paused for review (policy rules with on_fail: review) wait for a person.
-    stagehand.page.context.set_default_timeout(360_000)
+    session = await asyncio.to_thread(open_session, settings)  # a blocking HTTP call: off the event loop
     try:
-        async with session.guard():  # Statelock (optional): a violation raises StatelockPolicyViolationError
-            await OjsAgent(settings, stagehand).run()
+        await run_governed(settings, session, OjsAgent.run)
     except StatelockPolicyViolationError as violation:
         logger.error("Statelock stopped the agent: %s: %s", violation.rule, violation.reason)  # noqa: TRY400
         return 2
-    finally:
-        await stagehand.close()
     return 0
 
 

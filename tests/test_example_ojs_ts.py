@@ -22,7 +22,7 @@ pytest.importorskip("playwright.async_api")
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "ojs-ts"
 if not (EXAMPLE / "node_modules").is_dir() or not (ROOT / "js" / "dist").is_dir() or not shutil.which("npx"):
-    pytest.skip("examples/ojs-ts is not installed (npm install)", allow_module_level=True)
+    pytest.skip("examples/ojs-ts is not installed (npm ci in js/ and examples/ojs-ts/)", allow_module_level=True)
 sys.path.insert(0, str(ROOT / "examples" / "ojs"))
 
 import mock_ojs  # noqa: E402

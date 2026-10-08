@@ -1,0 +1,45 @@
+# Developer Certificate of Origin (CONTRIBUTING.md): every commit needs a Signed-off-by
+# line that matches its author. Runs on every pull request, and from release.yml for the
+# commits since the last release tag. Bot commits (author name ending in [bot]) are exempt.
+name: DCO
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  sign-off:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the whole history and the tags
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Every commit is signed off by its author
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ -n "$BASE" ]; then
+            range="$BASE..$HEAD_SHA"
+          elif last=$(git describe --tags --abbrev=0 --match 'v*' "$HEAD_SHA" 2>/dev/null); then
+            range="$last..$HEAD_SHA"
+          else
+            range="$HEAD_SHA"   # no release yet: every commit
+          fi
+          echo "Checking $range"
+          bad=0
+          while IFS=$'\x1f' read -r sha author signoffs; do
+            case "$author" in *"[bot] <"*) continue ;; esac
+            if ! tr '\036' '\n' <<< "$signoffs" | grep -qixF -- "$author"; then
+              echo "::error::${sha:0:12} by $author has no matching Signed-off-by line"
+              bad=1
+            fi
+          done < <(git log --no-merges --format='%H%x1f%an <%ae>%x1f%(trailers:key=Signed-off-by,valueonly,separator=%x1e)' "$range")
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::Sign off with 'git commit -s' (see CONTRIBUTING.md)"
+          fi
+          exit "$bad"

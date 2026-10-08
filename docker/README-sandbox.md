@@ -20,6 +20,8 @@ curl -fsSL -o docker/seccomp_profile.json \
 
 ## Check
 
+With `.env` and `keys.yaml` in place (see the README, Development):
+
 ```bash
 docker compose run --rm statelock statelock check-sandbox
 # Chromium started (sandbox=on).

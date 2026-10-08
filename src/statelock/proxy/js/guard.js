@@ -1,28 +1,56 @@
 // SPDX-License-Identifier: Apache-2.0
 // Statelock page guard. Runs in an isolated world, invisible to page scripts.
 // Placeholders replaced at install: __STATELOCK_PATTERNS__, __STATELOCK_BINDING__, __STATELOCK_EVENTS__,
-// __STATELOCK_REPLAY_ELEMENT__.
+// __STATELOCK_REPLAY_ELEMENT__; and by load_js, the shared frame depth limit (MAX_FRAME_DEPTH).
 (() => {
   if (globalThis.__statelockGuardInstalled) return;
   globalThis.__statelockGuardInstalled = true;
   const patterns = __STATELOCK_PATTERNS__;
   // Absolute scopes are parsed by Python (core/urls.py); path-only scopes remain substrings.
-  const matchesScope = (scope) => {
-    const address = location.host
-      ? `${location.protocol}//${location.host}${location.pathname}`
-      : `${location.protocol}${location.pathname}`;
+  const matchesScope = (scope, where) => {
+    const address = where.host
+      ? `${where.protocol}//${where.host}${where.pathname}`
+      : `${where.protocol}${where.pathname}`;
     if ('substring' in scope) return address.includes(scope.substring);
-    if (!['http:', 'https:'].includes(location.protocol) || location.origin !== scope.origin) return false;
+    if (!['http:', 'https:'].includes(where.protocol) || where.origin !== scope.origin) return false;
     if (!scope.path) return true;
-    let index = location.pathname.indexOf(scope.path);
+    let index = where.pathname.indexOf(scope.path);
     while (index !== -1) {
       const end = index + scope.path.length;
-      if (end === location.pathname.length || location.pathname[end] === '/') return true;
-      index = location.pathname.indexOf(scope.path, index + 1);
+      if (end === where.pathname.length || where.pathname[end] === '/') return true;
+      index = where.pathname.indexOf(scope.path, index + 1);
     }
     return false;
   };
-  const governed = () => patterns === null || patterns.some(matchesScope);
+  // An ancestor frame Statelock can only see the origin of (cross-origin): governed when
+  // the origin may match (a path-only scope, or an absolute scope on that origin).
+  const originMayMatch = (origin) => patterns.some((scope) => 'substring' in scope || scope.origin === origin);
+  // A frame is governed like the page it is in: about:srcdoc and about:blank frames, and
+  // frames of other origins, inside a governed page are governed too.
+  const governed = () => {
+    if (patterns === null) return true;
+    const origins = location.ancestorOrigins;
+    let frame = window;
+    for (let depth = 0; depth < __STATELOCK_MAX_FRAME_DEPTH__; depth += 1) {
+      let where = null;
+      try {
+        where = frame.location;
+        void where.href; // throws for a cross-origin frame
+      } catch (error) {
+        where = null;
+      }
+      if (where !== null) {
+        if (patterns.some((scope) => matchesScope(scope, where))) return true;
+      } else {
+        // depth >= 1 here: ancestorOrigins[0] is the parent's origin.
+        const origin = origins && depth >= 1 ? origins[depth - 1] : undefined;
+        if (origin === undefined || originMayMatch(origin)) return true; // unknown: fail closed
+      }
+      if (frame === window.top) return false;
+      frame = frame.parent;
+    }
+    return true;
+  };
   const report = (payload) => {
     try {
       globalThis.__STATELOCK_BINDING__(JSON.stringify(payload));
@@ -100,6 +128,22 @@
     return rejected;
   };
 
+  // A trusted user gesture (real click, key or touch) in the current task. A submit event
+  // is trusted also when code calls form.requestSubmit(); it is a real submission only
+  // when it happens during such a gesture (a click on a submit button, Enter in a field).
+  let gesture = false;
+  const noteGesture = (event) => {
+    if (!event.isTrusted || gesture) return;
+    gesture = true;
+    setTimeout(() => {
+      gesture = false;
+    }, 0);
+  };
+  for (const type of ['click', 'keydown', 'keypress', 'keyup', 'pointerdown', 'pointerup', 'mousedown', 'mouseup',
+    'touchstart', 'touchend', 'drop']) {
+    window.addEventListener(type, noteGesture, true);
+  }
+
   const handler = (event) => {
     if (!governed()) return;
     if (event.isTrusted) {
@@ -108,8 +152,7 @@
         cancel(event);
         return;
       }
-      // A real submission always fires a trusted submit event.
-      if (event.type === 'submit') report({ kind: 'trusted_submit', url: location.href });
+      if (event.type === 'submit' && gesture) report({ kind: 'trusted_submit', url: location.href });
       return;
     }
     // Synthetic event from page code: cancel before any page handler runs.

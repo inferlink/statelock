@@ -8,8 +8,11 @@ an entry point in the ``statelock.plugins`` group:
     my_plugin = "my_package.plugin:plugin"
 
 ``setup`` may replace ``ctx.services.sink`` (for example with a wrapper),
-subscribe to ``ctx.services.events``, register policy rules, and add routes
-or middleware to ``ctx.app``.
+subscribe to ``ctx.services.events``, and add routes or middleware to ``ctx.app``.
+
+Plugins cannot add policy rules: policies are loaded and validated before
+plugins run. Ship a custom rule in a module named by a ``statelock.rules`` entry
+point or by ``STATELOCK_RULE_MODULES`` (see statelock.policy.extensions).
 """
 
 from __future__ import annotations

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import socket
 import threading
 import time
@@ -30,7 +31,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response  # noqa: E402
 
 from statelock.app import create_app, get_services  # noqa: E402
 from statelock.auth import hash_key  # noqa: E402
-from statelock.client import StatelockPolicyViolationError, connect_statelock  # noqa: E402
+from statelock.client import StatelockPolicyViolationError  # noqa: E402
+from statelock.client.connection import connect_with_headers  # noqa: E402
 from statelock.settings import Settings  # noqa: E402
 
 # Authentication is on for every browser test: each agent connects with its own key.
@@ -128,7 +130,8 @@ SITE = {
 <button id=pay onclick="document.getElementById('state').textContent='paid'">Pay</button>
 <button id=del>Delete</button>
 <script>if (location.search.includes('drift'))
-  setTimeout(() => { document.getElementById('amount').textContent = '$9,000.00' }, 1500)</script>
+  setTimeout(() => { document.getElementById('amount').textContent = '$9,000.00';
+    fetch('/gov/api/drifted', {method: 'POST'}) }, 1500)</script>
 </body></html>""",
     "/gov/relay": """<html><head><title>Relay</title></head><body>
 <button id=relay onclick="document.getElementById('hidden-go').click()">Relay</button>
@@ -174,7 +177,8 @@ def site_router() -> APIRouter:
     for path in SITE:
         router.add_api_route(path, page(path), methods=["GET", "POST"])
 
-    async def api() -> JSONResponse:
+    async def api(name: str, request: Request) -> JSONResponse:
+        site_calls(request.app).append(name)
         return JSONResponse({})
 
     router.add_api_route("/gov/api/{name}", api, methods=["GET", "POST"])
@@ -240,18 +244,38 @@ def site_router() -> APIRouter:
     return router
 
 
+# CI sets this: a missing Chromium then fails the browser tests instead of skipping them.
+REQUIRE_BROWSER_ENV = "STATELOCK_REQUIRE_BROWSER"
+
+
+def site_calls(app: Any) -> list[str]:
+    """The names of the test site's /gov/api/<name> calls, in order (a test can wait for one)."""
+    if not hasattr(app.state, "site_calls"):
+        app.state.site_calls = []
+    calls: list[str] = app.state.site_calls
+    return calls
+
+
 def chromium_available() -> bool:
+    """Whether Playwright's Chromium is installed. False skips the browser tests, unless
+    STATELOCK_REQUIRE_BROWSER=1: then a missing Chromium fails the calling test."""
+
     async def probe() -> bool:
         async with playwright_api.async_playwright() as p:
             return Path(p.chromium.executable_path).exists()
 
     try:
-        return asyncio.run(probe())
+        available = asyncio.run(probe())
     except Exception:
-        return False
+        available = False
+    if not available and os.environ.get(REQUIRE_BROWSER_ENV) == "1":
+        pytest.fail(f"Playwright Chromium is not installed and {REQUIRE_BROWSER_ENV}=1", pytrace=False)
+    return available
 
 
 FIRST_LOAD_TIMEOUT_MS = 90_000
+# How long a test waits for the page to show an expected result (generous for a busy CI host).
+WAIT_MS = 10_000
 
 
 async def _first_load(page: Any, url: str) -> None:
@@ -274,22 +298,29 @@ def _probe(url: str) -> str:
         return f"the site does not answer directly either ({error})"
 
 
-async def agent_session(server: dict[str, Any], agent: str, start: str, steps: Any) -> tuple[str, Any]:
+async def _governed(
+    server: dict[str, Any], agent: str, start: str, steps: Callable[[Any, Any], Awaitable[Any]]
+) -> tuple[str, Any]:
+    """Connect ``agent``, load ``start``, run ``steps(conn, page)`` under the guard, close.
+    Returns (session id, the steps' result or the StatelockPolicyViolationError)."""
     async with playwright_api.async_playwright() as p:
-        conn = await connect_statelock(p, server["ws"], agent, api_key=agent_key(agent))
+        conn = await connect_with_headers(p, server["ws"], agent, api_key=agent_key(agent))
         page = conn.browser.contexts[0].pages[0]
         try:
             async with conn.guard():
                 # The first load waits for Chromium to start inside the proxy, which can take
                 # longer than Playwright's 30 s default on a busy Docker host.
                 await _first_load(page, server["base"] + start)
-                result = await steps(page)
-            return conn.session_id, result
+                return conn.session_id, await steps(conn, page)
         except StatelockPolicyViolationError as violation:
             return conn.session_id, violation
         finally:
             if conn.browser.is_connected():
                 await conn.browser.close()
+
+
+async def agent_session(server: dict[str, Any], agent: str, start: str, steps: Any) -> tuple[str, Any]:
+    return await _governed(server, agent, start, lambda _conn, page: steps(page))
 
 
 def run_session(server: dict[str, Any], agent: str, start: str, steps: Any) -> tuple[str, Any]:
@@ -333,56 +364,24 @@ def actions(server: dict[str, Any], session_id: str, method: str | None = None) 
 
 
 async def upload_session(server: dict[str, Any], steps: Any) -> tuple[str, Any]:
-    async with playwright_api.async_playwright() as p:
-        conn = await connect_statelock(p, server["ws"], "flow_agent", api_key=agent_key("flow_agent"))
-        page = conn.browser.contexts[0].pages[0]
-        try:
-            async with conn.guard():
-                await page.goto(server["base"] + "/gov/upload")
-                return conn.session_id, await steps(conn, page)
-        except StatelockPolicyViolationError as violation:
-            return conn.session_id, violation
-        finally:
-            if conn.browser.is_connected():
-                await conn.browser.close()
+    return await _governed(server, "flow_agent", "/gov/upload", steps)
 
 
 async def portal_session(server: dict[str, Any], scenario: str, upload_name: str = "remittance.pdf") -> tuple[str, Any]:
-    async with playwright_api.async_playwright() as p:
-        conn = await connect_statelock(
-            p, server["ws"], "portal_reconciliation_agent", api_key=agent_key("portal_reconciliation_agent")
-        )
-        page = conn.browser.contexts[0].pages[0]
-        try:
-            async with conn.guard():
-                await page.goto(f"{server['base']}/demo/bank?scenario={scenario}")
-                await page.inner_text("#deposit-amount")  # read only: no governed action on the bank page
-                await page.goto(f"{server['base']}/demo/erp?scenario={scenario}")
-                remittance = {"name": upload_name, "mimeType": "application/pdf", "buffer": b"%PDF-1.4"}
-                await conn.set_input_files(page, "#remittance", [remittance])
-                await page.click("text=Mark as Paid")
-                await page.wait_for_selector("text=Reconciliation complete", timeout=2000)
-                return conn.session_id, "completed"
-        except StatelockPolicyViolationError as violation:
-            return conn.session_id, violation
-        finally:
-            if conn.browser.is_connected():
-                await conn.browser.close()
+    async def steps(conn: Any, page: Any) -> str:
+        await page.inner_text("#deposit-amount")  # read only: no governed action on the bank page
+        await page.goto(f"{server['base']}/demo/erp?scenario={scenario}")
+        remittance = {"name": upload_name, "mimeType": "application/pdf", "buffer": b"%PDF-1.4"}
+        await conn.set_input_files("#remittance", [remittance], page=page)
+        await page.click("text=Mark as Paid")
+        await page.wait_for_selector("text=Reconciliation complete", timeout=WAIT_MS)
+        return "completed"
+
+    return await _governed(server, "portal_reconciliation_agent", f"/demo/bank?scenario={scenario}", steps)
 
 
 async def download_session(server: dict[str, Any], steps: Any) -> tuple[str, Any]:
-    async with playwright_api.async_playwright() as p:
-        conn = await connect_statelock(p, server["ws"], "flow_agent", api_key=agent_key("flow_agent"))
-        page = conn.browser.contexts[0].pages[0]
-        try:
-            async with conn.guard():
-                await page.goto(server["base"] + "/gov/docs")
-                return conn.session_id, await steps(conn, page)
-        except StatelockPolicyViolationError as violation:
-            return conn.session_id, violation
-        finally:
-            if conn.browser.is_connected():
-                await conn.browser.close()
+    return await _governed(server, "flow_agent", "/gov/docs", steps)
 
 
 # (name, agents, path, value) of each secret in the proxy's secrets file; the

@@ -39,6 +39,7 @@ class SystemRule(str, Enum):
     DOWNLOAD_LIMIT = "download_limit"
     COOKIE_EXPORT = "cookie_export"  # the agent may not read the browser's cookies
     REQUEST_ACCESS = "request_access"  # a Statelock.fetch the agent's request_access does not allow
+    REQUEST_CONCURRENCY = "request_concurrency"  # a Statelock.fetch beyond the session's concurrent-request limit
     SECRET_INJECTION = "secret_injection"  # noqa: S105 - a rule name: a {{secret:...}} placeholder where it may not be typed
 
 

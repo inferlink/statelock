@@ -51,17 +51,28 @@ class Services:
     @classmethod
     def from_settings(cls, settings: Settings) -> Services:
         """Build default services. A missing policy or keys file fails here, at startup."""
+        chromium = launcher(settings)
+        chromium.sweep_stale_profiles()  # Chromium profiles a killed proxy left behind
         load_rule_modules(settings.rule_modules)  # custom rules, before the policy files name them
         return cls(
             authenticator=Authenticator.from_settings(settings.auth_mode, settings.auth_keys_file),
             settings=settings,
             evaluator=PolicyEvaluator.from_files(settings.policy_files, perception_evaluator(settings)),
             sink=LocalJsonSink(settings.artifact_dir, write_latest=settings.debug),
-            launcher=ChromiumCdpLauncher(host=settings.chromium_host, sandbox=settings.chromium_sandbox),
+            launcher=chromium,
             registry=ViolationRegistry(settings.violation_registry_size),
             saved_sessions=saved_session_store(settings),
             secrets=SecretStore.load(settings.secrets_file) if settings.secrets_file else SecretStore(),
         )
+
+
+def launcher(settings: Settings) -> ChromiumCdpLauncher:
+    """The governed Chromium's launcher, as configured."""
+    return ChromiumCdpLauncher(
+        sandbox=settings.chromium_sandbox,
+        start_timeout=settings.chromium_start_timeout,
+        command_timeout=settings.cdp_command_timeout,
+    )
 
 
 def perception_evaluator(settings: Settings) -> PerceptionEvaluator | None:

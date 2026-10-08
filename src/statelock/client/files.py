@@ -6,8 +6,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
-import time
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, TypeVar
@@ -15,10 +16,13 @@ from typing import Any, BinaryIO, TypeVar
 from playwright.async_api import CDPSession, ElementHandle, Locator, Page
 from playwright.async_api import Error as PlaywrightError
 
-from statelock.client import transfer
-from statelock.client.transfer import DownloadInfo, StatelockDownloadError, UploadFile
+from statelock.client import patching, transfer
+from statelock.client.transfer import DownloadInfo, UploadFile
 
 T = TypeVar("T")
+
+# Per browser (or context without one): its Statelock.session answer.
+_sessions: weakref.WeakKeyDictionary[Any, dict[str, Any] | None] = weakref.WeakKeyDictionary()
 
 
 @contextlib.asynccontextmanager
@@ -54,6 +58,21 @@ async def run(steps: transfer.Steps[T], cdp: CDPSession, write: Callable[[bytes]
             error = raised
 
 
+async def statelock_session(page: Page) -> dict[str, Any] | None:
+    """{session_id, agent_id} if the page's browser is connected through Statelock, else None."""
+    key = page.context.browser or page.context
+    if key not in _sessions:
+        async with cdp_session(page) as cdp:
+            # Only an answer is cached: an error (a closed page) raises and is asked again next time.
+            _sessions[key] = await run(transfer.session_steps(), cdp)
+    return _sessions[key]
+
+
+def forget_sessions() -> None:
+    """Forget which browsers are Statelock sessions (uninstall)."""
+    _sessions.clear()
+
+
 # Uploads ------------------------------------------------------------------------------------
 
 
@@ -61,6 +80,7 @@ async def set_input_files(
     page: Page,
     target: str | Locator | ElementHandle,
     files: UploadFile | Sequence[UploadFile],
+    *,
     timeout: float | None = None,
 ) -> list[dict[str, Any]]:
     """Upload files to Statelock, then set them on a file input with DOM.setFileInputFiles.
@@ -146,41 +166,72 @@ class StatelockDownload(DownloadInfo):
         return target
 
 
-class DownloadWaiter:
+class DownloadWaiter(transfer.Waiter[StatelockDownload]):
     """What ``expect_download`` yields; ``value`` (awaitable, like Playwright's
     ``EventContextManager.value``) is the download after the block."""
 
-    def __init__(self) -> None:
-        self._download: StatelockDownload | None = None
-
     @property
     async def value(self) -> StatelockDownload:
-        if self._download is None:
-            raise StatelockDownloadError("the download is only available after the expect_download block")
-        return self._download
+        return self.result()
 
 
 @contextlib.asynccontextmanager
 async def expect_download(
     page: Page,
-    timeout: float,
-    on_blocked: Callable[[transfer.DownloadBlocked], Awaitable[BaseException]],
     predicate: Callable[[StatelockDownload], bool] | None = None,
+    *,
+    timeout: float | None = None,
 ) -> AsyncIterator[DownloadWaiter]:
-    """Wait for the next download the block starts, after Statelock has checked it.
-    ``timeout`` is in seconds. Raises ``await on_blocked(...)`` if Statelock blocked it."""
+    """Wait for the next download the block starts (the first one ``predicate``
+    accepts), after Statelock has checked it. ``timeout`` is in milliseconds, as in
+    Playwright: by default the page's ``set_default_timeout`` (recorded after
+    ``install()``), else 30000; 0 waits without a limit.
+
+    Raises StatelockPolicyViolationError if Statelock blocked the download (the rule
+    it reports; a guard adds the recorded violation).
+    """
+    session = await statelock_session(page)
+    if not session:
+        raise RuntimeError("expect_download: the page's browser is not connected through Statelock")
+    seconds = transfer.download_timeout_seconds(timeout, patching.default_timeout_ms(page))
+
+    def accept(info: DownloadInfo) -> StatelockDownload | None:
+        download = StatelockDownload(**vars(info), page=page)
+        return download if predicate is None or predicate(download) else None
+
     waiter = DownloadWaiter()
     async with cdp_session(page) as cdp:
         known = await run(transfer.known_downloads_steps(), cdp)
         yield waiter
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                info = await run(transfer.wait_for_download_steps(known, max(0, deadline - time.monotonic())), cdp)
-            except transfer.DownloadBlocked as blocked:
-                raise await on_blocked(blocked) from None
-            download = StatelockDownload(**vars(info), page=page)
-            if predicate is None or predicate(download):
-                waiter._download = download
-                return
-            known.add(info.guid)
+        steps = transfer.expect_download_steps(known, seconds, accept, session.get("session_id"))
+        waiter.resolve(await run(steps, cdp))
+
+
+class FileMethods:
+    """``set_input_files`` and ``expect_download`` on a governed session object; ``page``
+    defaults to the session's first page."""
+
+    @property
+    def page(self) -> Page:
+        raise NotImplementedError
+
+    async def set_input_files(
+        self,
+        target: str | Locator | ElementHandle,
+        files: UploadFile | Sequence[UploadFile],
+        *,
+        page: Page | None = None,
+        timeout: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Upload files through Statelock into a file input (see ``set_input_files``)."""
+        return await set_input_files(page or self.page, target, files, timeout=timeout)
+
+    def expect_download(
+        self,
+        predicate: Callable[[StatelockDownload], bool] | None = None,
+        *,
+        page: Page | None = None,
+        timeout: float | None = None,
+    ) -> AbstractAsyncContextManager[DownloadWaiter]:
+        """The next download Statelock checked (see ``expect_download``)."""
+        return expect_download(page or self.page, predicate, timeout=timeout)

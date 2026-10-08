@@ -28,7 +28,6 @@ def _attached(session_id: str, target_id: str, target_type: str = "page") -> str
 def test_target_registry_tracks_attach_and_detach() -> None:
     targets = TargetRegistry()
     targets.track(_attached("S1", "T1"))
-    targets.track(b"binary")
     targets.track('{"id": 3, "result": {}}')
     assert targets.target_for("S1") == "T1"
     targets.track(json.dumps({"method": "Target.detachedFromTarget", "params": {"sessionId": "S1"}}))
@@ -105,6 +104,57 @@ def test_command_waiting_on_a_target_that_detaches_is_not_refused() -> None:
         return result
 
     assert run(scenario()) is None
+
+
+def _detached(session_id: str) -> str:
+    return json.dumps({"method": "Target.detachedFromTarget", "params": {"sessionId": session_id}})
+
+
+def test_target_setup_runs_once_per_target_across_attaches() -> None:
+    # Attaching to a tab again must not install the page guard again (that would reset
+    # what it learned, e.g. which scripts agent code created).
+    async def scenario():
+        setup = _FakeSetup()
+        targets = TargetRegistry()
+        targets.add_setup(setup)
+        targets.track(_attached("S1", "T1"))
+        targets.track(_attached("S2", "T1"))  # a second session while the setup runs
+        assert await targets.await_ready("S1") is None
+        assert await targets.await_ready("S2") is None
+        targets.track(_detached("S1"))
+        targets.track(_detached("S2"))
+        targets.track(_attached("S3", "T1"))  # detached and attached again
+        assert await targets.await_ready("S3") is None
+        await targets.close()
+        return setup.done
+
+    assert run(scenario()) == ["T1"]
+
+
+def test_failed_or_abandoned_target_setup_runs_again_on_attach() -> None:
+    async def scenario():
+        setup = _FakeSetup(fail=True)
+        targets = TargetRegistry()
+        targets.add_setup(setup)
+        targets.track(_attached("S1", "T1"))
+        failed = await targets.await_ready("S1")
+        setup.fail = False
+        targets.track(_attached("S2", "T1"))
+        retried = await targets.await_ready("S2")
+        slow = _FakeSetup(delay=1)
+        other = TargetRegistry()
+        other.add_setup(slow)
+        other.track(_attached("S3", "T2"))
+        await asyncio.sleep(0.01)
+        other.track(_detached("S3"))  # cancelled: nobody waits for it
+        slow.delay = 0.01
+        other.track(_attached("S4", "T2"))
+        restarted = await other.await_ready("S4")
+        await targets.close()
+        await other.close()
+        return failed, retried, restarted, slow.done
+
+    assert run(scenario()) == ("boom", None, None, ["T2"])
 
 
 # SequencedWriter ------------------------------------------------------------------------------

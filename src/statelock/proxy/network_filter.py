@@ -6,9 +6,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from statelock.audit.redaction import REDACTED
+
 SENSITIVE_HEADERS = {"cookie", "set-cookie", "authorization", "proxy-authorization"}
 COOKIE_DETAIL_KEYS = {"associatedCookies", "blockedCookies", "exemptedCookies", "cookie"}
-REDACTED = "[REDACTED]"
 
 
 def _clean(value: Any, key: str = "") -> Any:
@@ -26,7 +27,8 @@ def _clean(value: Any, key: str = "") -> Any:
 
 
 def filter_network_message(raw: str) -> str:
-    """Preserve non-network CDP messages byte-for-byte."""
+    """Remove cookies, authorization headers and raw header text from a Network.* event.
+    Any other message is returned unchanged, byte for byte."""
     if '"Network.' not in raw:
         return raw
     try:

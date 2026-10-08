@@ -24,7 +24,12 @@ class SequencedWriter:
     synchronous so a cancelled task cannot stall later writers.
     """
 
-    def __init__(self, sink: ArtifactSink, events: Events) -> None:
+    def __init__(
+        self,
+        sink: ArtifactSink,
+        events: Events,
+        scrub: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
         self.sink = sink
         self.events = events
         self._allocated = 0
@@ -32,7 +37,7 @@ class SequencedWriter:
         self._finished: set[int] = set()
         self._waiters: dict[int, asyncio.Future[None]] = {}
         # Applied to each record's payload before it is stored (e.g. removing injected secrets).
-        self.scrub: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+        self.scrub = scrub
 
     @asynccontextmanager
     async def slot(self) -> AsyncIterator[Slot]:

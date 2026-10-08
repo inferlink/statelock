@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
@@ -10,7 +12,15 @@ import pytest
 pytest.importorskip("playwright.async_api")
 
 import httpx
-from browser_support import REVIEWER_KEY, StatelockPolicyViolationError, actions, agent_key, agent_session
+from browser_support import (
+    REVIEWER_KEY,
+    WAIT_MS,
+    StatelockPolicyViolationError,
+    actions,
+    agent_key,
+    agent_session,
+    site_calls,
+)
 
 from statelock.audit.records import SCHEMA_VERSION
 
@@ -19,8 +29,10 @@ pytestmark = pytest.mark.browser
 REVIEWER = {"Authorization": f"Bearer {REVIEWER_KEY}"}
 
 
-async def _decide(server: dict[str, Any], decision: str, delay: float = 0.0) -> dict[str, Any]:
-    """Wait for the first pending review, then approve or deny it."""
+async def _decide(
+    server: dict[str, Any], decision: str, before: Callable[[], Awaitable[Any]] | None = None
+) -> dict[str, Any]:
+    """Wait for the first pending review (and ``before``, if given), then approve or deny it."""
     async with httpx.AsyncClient(base_url=server["base"], headers=REVIEWER) as http:
         for _ in range(200):
             reviews = (await http.get("/reviews")).json()["reviews"]
@@ -30,7 +42,8 @@ async def _decide(server: dict[str, Any], decision: str, delay: float = 0.0) -> 
         else:
             raise AssertionError("no review was requested")
         review = reviews[0]
-        await asyncio.sleep(delay)
+        if before is not None:
+            await before()
         response = await http.post(
             f"/reviews/{review['review_id']}/decision", json={"decision": decision, "comment": "checked the invoice"}
         )
@@ -39,16 +52,29 @@ async def _decide(server: dict[str, Any], decision: str, delay: float = 0.0) -> 
 
 
 def _session(
-    server: dict[str, Any], selector: str, decision: str | None, *, start: str = "/gov/approve", delay: float = 0.0
+    server: dict[str, Any],
+    selector: str,
+    decision: str | None,
+    *,
+    start: str = "/gov/approve",
+    decide_after: str | None = None,
 ) -> tuple[str, Any, dict[str, Any] | None]:
+    """``decide_after``: a test-site API call (/gov/api/<name>) the reviewer waits for before deciding."""
     seen: dict[str, Any] = {}
 
+    async def site_called() -> None:
+        deadline = time.monotonic() + WAIT_MS / 1000
+        while decide_after not in site_calls(server["app"]):
+            assert time.monotonic() < deadline, f"the page did not call /gov/api/{decide_after}"
+            await asyncio.sleep(0.05)
+
     async def steps(page: Any) -> str:
-        reviewer = asyncio.ensure_future(_decide(server, decision, delay)) if decision else None
+        before = site_called if decide_after else None
+        reviewer = asyncio.ensure_future(_decide(server, decision, before)) if decision else None
         try:
             # A reviewed action waits for a person: the agent's timeout must allow for that.
             await page.click(selector, timeout=60_000)
-            await page.wait_for_selector("text=paid", timeout=2000)
+            await page.wait_for_selector("text=paid", timeout=WAIT_MS)
             return "paid"
         finally:
             if reviewer is not None:
@@ -112,7 +138,7 @@ def test_blocking_rule_wins_without_review(server: dict[str, Any]) -> None:
 
 def test_page_change_during_review_blocks(server: dict[str, Any]) -> None:
     # The amount changes from $5,000 to $9,000 while the reviewer looks at $5,000.
-    _, result, review = _session(server, "#pay", "approve", start="/gov/approve?drift=1", delay=2.0)
+    _, result, review = _session(server, "#pay", "approve", start="/gov/approve?drift=1", decide_after="drifted")
     assert review is not None and "5,000.00" in review["failures"][0]["reason"]
     assert isinstance(result, StatelockPolicyViolationError), result
     assert "page changed while the action waited" in result.reason

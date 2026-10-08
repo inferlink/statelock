@@ -13,7 +13,7 @@ pytest.importorskip("playwright.async_api")
 from browser_support import StatelockPolicyViolationError, actions, agent_key, running_server
 from playwright.async_api import async_playwright
 
-from statelock.client import connect_statelock
+from statelock.client.connection import connect_with_headers
 
 pytestmark = pytest.mark.browser
 
@@ -42,7 +42,7 @@ def touch_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str,
 def _tap(server: dict[str, Any], agent: str) -> tuple[str, Any]:
     async def session() -> tuple[str, Any]:
         async with async_playwright() as playwright:
-            conn = await connect_statelock(playwright, server["ws"], agent, api_key=agent_key(agent))
+            conn = await connect_with_headers(playwright, server["ws"], agent, api_key=agent_key(agent))
             try:
                 async with conn.guard():
                     context = await conn.browser.new_context(has_touch=True)
@@ -87,7 +87,7 @@ def test_tap_on_a_prohibited_element_is_blocked(touch_server: dict[str, Any]) ->
 def test_char_enter_on_focused_button_is_governed(touch_server: dict[str, Any]) -> None:
     async def session() -> tuple[str, Any]:
         async with async_playwright() as playwright:
-            conn = await connect_statelock(
+            conn = await connect_with_headers(
                 playwright, touch_server["ws"], "tap_block_agent", api_key=agent_key("tap_block_agent")
             )
             try:
@@ -113,7 +113,7 @@ def test_char_enter_on_focused_button_is_governed(touch_server: dict[str, Any]) 
 def test_nested_button_label_with_nbsp_is_blocked(touch_server: dict[str, Any]) -> None:
     async def session() -> Any:
         async with async_playwright() as playwright:
-            conn = await connect_statelock(
+            conn = await connect_with_headers(
                 playwright, touch_server["ws"], "tap_block_agent", api_key=agent_key("tap_block_agent")
             )
             try:

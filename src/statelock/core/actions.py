@@ -3,8 +3,7 @@
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
@@ -62,19 +61,62 @@ SHORTCUT_MODIFIERS = 1 | 2 | 4  # Alt, Ctrl, Meta
 KEY_DOWN_TYPES = {"keyDown", "rawKeyDown"}
 RELEASE_TYPES = {"mouseReleased", "touchEnd", "keyUp"}
 
-ENTER_KEYS = {"Enter"}
+# Enter and Space, by key name, code, Windows key code, or the text a key event types
+# (text or unmodifiedText). Chromium acts on any of these, and so may page scripts.
+ENTER_KEYS = {"Enter", "\r", "\n"}
 ENTER_CODES = {"Enter", "NumpadEnter"}
-SPACE_KEYS = {" "}
+ENTER_TEXTS = {"\r", "\n", "\r\n"}
+SPACE_KEYS = {" ", "Spacebar"}
 SPACE_CODES = {"Space"}
+SPACE_TEXTS = {" "}
+ENTER_KEY_CODE = 13
+SPACE_KEY_CODE = 32
+# Set by the governor on a char event that types the key a preceding rawKeyDown (or a
+# keyDown without text) on the same CDP session already pressed: that key's activation
+# began at the key down and commits at its key up (see KeyPresses).
+FOLLOWS_KEY_DOWN_PARAM = "statelock_follows_key_down"
+
+
+def _named(params: dict[str, Any], keys: set[str], codes: set[str], key_code: int) -> bool:
+    return params.get("key") in keys or params.get("code") in codes or params.get("windowsVirtualKeyCode") == key_code
+
+
+def _typed(params: dict[str, Any], texts: set[str]) -> bool:
+    return params.get("text") in texts or params.get("unmodifiedText") in texts
 
 
 def is_enter_key(params: dict[str, Any]) -> bool:
-    return (
-        params.get("key") in ENTER_KEYS
-        or params.get("code") in ENTER_CODES
-        or params.get("windowsVirtualKeyCode") == 13
-        or (params.get("type") == "char" and params.get("text") in {"\r", "\n"})
+    return _named(params, ENTER_KEYS, ENTER_CODES, ENTER_KEY_CODE) or _typed(params, ENTER_TEXTS)
+
+
+def is_space_key(params: dict[str, Any]) -> bool:
+    return _named(params, SPACE_KEYS, SPACE_CODES, SPACE_KEY_CODE) or _typed(params, SPACE_TEXTS)
+
+
+def _activation_key_name(params: dict[str, Any]) -> str | None:
+    if is_enter_key(params):
+        return "enter"
+    if is_space_key(params):
+        return "space"
+    return None
+
+
+def _named_by_text_only(params: dict[str, Any]) -> bool:
+    """Enter or Space given only as typed text, with no key, code or key code naming it."""
+    return not _named(params, ENTER_KEYS, ENTER_CODES, ENTER_KEY_CODE) and not _named(
+        params, SPACE_KEYS, SPACE_CODES, SPACE_KEY_CODE
     )
+
+
+def pressed_key_names(params: dict[str, Any]) -> set[str]:
+    """Lower-case names a key event matches in ``trigger.key``: its key and code, plus
+    "enter" for Enter and " " and "space" for Space however the event names them."""
+    names = {str(params.get(field) or "").casefold() for field in ("key", "code")} - {""}
+    if is_enter_key(params):
+        names.add("enter")
+    if is_space_key(params):
+        names.update({" ", "space"})
+    return names
 
 
 def is_pointer_method(method: str) -> bool:
@@ -83,18 +125,22 @@ def is_pointer_method(method: str) -> bool:
 
 def is_activation_key(params: dict[str, Any]) -> bool:
     """Keys that activate a focused button or link (Enter, Space)."""
-    return (
-        is_enter_key(params)
-        or params.get("key") in SPACE_KEYS
-        or params.get("code") in SPACE_CODES
-        or params.get("windowsVirtualKeyCode") == 32
-    )
+    return _activation_key_name(params) is not None
 
 
 def _is_activating_key(method: str, params: dict[str, Any]) -> bool:
     modifiers = params.get("modifiers")
     shortcut = isinstance(modifiers, int) and bool(modifiers & SHORTCUT_MODIFIERS)
     return method == KEY_METHOD and (is_activation_key(params) or shortcut)
+
+
+def _key_types_alone(params: dict[str, Any]) -> bool:
+    """A key event that types Enter or Space by itself: a char not following its key down,
+    or a key down named only by its text. It both starts and ends the activation."""
+    kind = params.get("type")
+    if kind == "char":
+        return params.get(FOLLOWS_KEY_DOWN_PARAM) is not True
+    return kind in KEY_DOWN_TYPES and _named_by_text_only(params)
 
 
 def starts_activation(method: str, params: dict[str, Any]) -> bool:
@@ -110,11 +156,20 @@ def starts_activation(method: str, params: dict[str, Any]) -> bool:
         return True
     if method == DRAG_METHOD:
         return kind == "drop"
-    return _is_activating_key(method, params) and (kind in KEY_DOWN_TYPES or kind == "char")
+    return _starts_key_activation(method, params)
+
+
+def _starts_key_activation(method: str, params: dict[str, Any]) -> bool:
+    if not _is_activating_key(method, params):
+        return False
+    if params.get("type") == "char":
+        return _key_types_alone(params)
+    return params.get("type") in KEY_DOWN_TYPES
 
 
 def is_commit(method: str, params: dict[str, Any]) -> bool:
-    """Actions after which post-conditions run: mouse or touch release, tap, drop and Enter release."""
+    """Actions after which post-conditions run: mouse or touch release, tap, drop, Enter
+    key up, and Enter typed by itself (a lone char, or a key down named only by text)."""
     kind = params.get("type")
     if method in MOUSE_LIKE_METHODS:
         return kind == "mouseReleased"
@@ -124,7 +179,9 @@ def is_commit(method: str, params: dict[str, Any]) -> bool:
         return True
     if method == DRAG_METHOD:
         return kind == "drop"  # the drop replaces the mouse release
-    return method == KEY_METHOD and kind in {"keyUp", "char"} and is_enter_key(params)
+    if method != KEY_METHOD or not is_enter_key(params):
+        return False
+    return kind == "keyUp" or _key_types_alone(params)
 
 
 def release_key(method: str, params: dict[str, Any], session_id: str | None) -> tuple[str, ...] | None:
@@ -143,6 +200,39 @@ def release_key(method: str, params: dict[str, Any], session_id: str | None) -> 
 def ends_activation(method: str, params: dict[str, Any]) -> bool:
     """The release of an activation: mouse release, touch end, or the key up of an activating key."""
     return params.get("type") in RELEASE_TYPES and release_key(method, params, None) is not None
+
+
+class KeyPresses:
+    """Per CDP session, the Enter or Space key held down by a rawKeyDown (or a keyDown
+    without text, which Chromium treats the same), so that the char typing it is not a
+    second activation and commit (rawKeyDown + char + keyUp is one key press)."""
+
+    MAX_SESSIONS = 256
+
+    def __init__(self) -> None:
+        self._down: dict[str | None, str] = {}
+
+    def annotate(self, action: CdpAction) -> CdpAction:
+        """The action with FOLLOWS_KEY_DOWN_PARAM set by Statelock (never taken from the agent)."""
+        if action.method != KEY_METHOD:
+            return action
+        params = {key: value for key, value in action.params.items() if key != FOLLOWS_KEY_DOWN_PARAM}
+        kind = params.get("type")
+        name = _activation_key_name(params)
+        # Any other key event ends the pairing: a later char is a key press of its own.
+        down = self._down.pop(action.session_id, None)
+        if kind == "char" and name is not None and down == name:
+            params[FOLLOWS_KEY_DOWN_PARAM] = True
+        elif (
+            kind in KEY_DOWN_TYPES
+            and name is not None
+            and not _named_by_text_only(params)
+            and (kind == "rawKeyDown" or not params.get("text"))
+        ):
+            self._down[action.session_id] = name
+            while len(self._down) > self.MAX_SESSIONS:
+                self._down.pop(next(iter(self._down)))
+        return replace(action, params=params)
 
 
 @dataclass(frozen=True)
@@ -170,42 +260,28 @@ class CdpAction:
         return release_key(self.method, self.params, self.session_id)
 
 
-def parse_cdp_message(raw_message: str) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(raw_message)
-    except json.JSONDecodeError:
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
 def classify_cdp_action(payload: dict[str, Any]) -> CdpAction | None:
+    """The governed input action a command is, or None when it is not one."""
     method = payload.get("method")
-    if not isinstance(method, str):
-        return None
-    kind = MUTATING_CDP_METHODS.get(method)
+    kind = MUTATING_CDP_METHODS.get(method) if isinstance(method, str) else None
     if kind is None:
         return None
-    message_id = payload.get("id")
-    params = payload.get("params", {})
-    session_id = payload.get("sessionId")
-    return CdpAction(
-        message_id=message_id if isinstance(message_id, int) else None,
-        method=method,
-        kind=kind,
-        params=params if isinstance(params, dict) else {},
-        session_id=session_id if isinstance(session_id, str) else None,
-    )
+    return _action(payload, str(method), kind)
 
 
 def protocol_action(payload: dict[str, Any]) -> CdpAction:
     """Wrap any CDP command as a PROTOCOL action (for refused commands)."""
+    return _action(payload, str(payload.get("method") or ""), ActionKind.PROTOCOL)
+
+
+def _action(payload: dict[str, Any], method: str, kind: ActionKind) -> CdpAction:
     message_id = payload.get("id")
     params = payload.get("params")
     session_id = payload.get("sessionId")
     return CdpAction(
         message_id=message_id if isinstance(message_id, int) else None,
-        method=str(payload.get("method") or ""),
-        kind=ActionKind.PROTOCOL,
+        method=method,
+        kind=kind,
         params=params if isinstance(params, dict) else {},
         session_id=session_id if isinstance(session_id, str) else None,
     )

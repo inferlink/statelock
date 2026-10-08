@@ -21,7 +21,7 @@ the wrapper asks Statelock whether the session ended in a violation and then
 raises StatelockPolicyViolationError (rule, reason), which stops the agent run. A
 violation found after an action that returned (a failed post-condition) is
 raised by the next tool call, which runs into the closed session. Successful
-calls cost no lookup. A lookup Statelock refuses (a wrong key) raises SessionUrlError.
+calls cost no lookup. A lookup Statelock refuses (a wrong key) raises StatelockClientError.
 
 The wrapper also raises LangChain's 1 s click timeout to 10 s (a governed click
 waits for Statelock's checks), and turns off the click tool's ``visible_only``

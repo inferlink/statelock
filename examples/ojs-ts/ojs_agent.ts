@@ -156,8 +156,8 @@ async function run(stagehand: Stagehand): Promise<Screening[]> {
       method: "click",
       arguments: [],
     });
-    // Statelock ends the session; guard()'s watch (every second) turns that into
-    // StatelockPolicyViolationError, which ends this wait. It is not a fixed delay.
+    // At most 15 s: Statelock ends the session, and guard()'s watch (every second) ends
+    // this wait sooner with StatelockPolicyViolationError.
     await page.waitForTimeout(15_000);
     throw new Error("NOT blocked: the prohibited click went through");
   }

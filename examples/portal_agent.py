@@ -7,13 +7,13 @@ the threshold (scenario large) wait for a human reviewer: approve or deny them a
 http://localhost:8010/review.
 
 Environment:
-  STATELOCK_URL              the Statelock server (default http://localhost:8010; Docker: http://statelock:8000)
-  STATELOCK_API_KEY          the agent's key
-  STATELOCK_PORTAL_BASE      where the demo pages are (default: STATELOCK_URL)
-  STATELOCK_PORTAL_SCENARIO  match | mismatch | large
-  STATELOCK_UPLOAD_NAME      remittance.pdf (use e.g. remittance.exe to see the upload rule block)
-  STATELOCK_EXPECT_BLOCK     true | false
-  STATELOCK_ACTION_TIMEOUT   seconds an action may take, including a wait for review (default 360)
+  STATELOCK_URL          the Statelock server (default http://localhost:8010; Docker: http://statelock:8000)
+  STATELOCK_API_KEY      the agent's key
+  DEMO_PORTAL_BASE       where the demo pages are (default: STATELOCK_URL)
+  DEMO_PORTAL_SCENARIO   match | mismatch | large
+  DEMO_UPLOAD_NAME       remittance.pdf (use e.g. remittance.exe to see the upload rule block)
+  DEMO_EXPECT_BLOCK      true | false
+  DEMO_ACTION_TIMEOUT    seconds an action may take, including a wait for review (default 360)
 """
 
 import asyncio
@@ -29,13 +29,13 @@ DEFAULT_STATELOCK_URL = "http://localhost:8010"
 
 async def run_portal_agent() -> None:
     server = os.getenv("STATELOCK_URL") or DEFAULT_STATELOCK_URL
-    base = (os.getenv("STATELOCK_PORTAL_BASE") or server).rstrip("/")
-    scenario = os.getenv("STATELOCK_PORTAL_SCENARIO", "match")
-    upload_name = os.getenv("STATELOCK_UPLOAD_NAME", "remittance.pdf")
-    expect_block = os.getenv("STATELOCK_EXPECT_BLOCK", "false").casefold() == "true"
+    base = (os.getenv("DEMO_PORTAL_BASE") or server).rstrip("/")
+    scenario = os.getenv("DEMO_PORTAL_SCENARIO", "match")
+    upload_name = os.getenv("DEMO_UPLOAD_NAME", "remittance.pdf")
+    expect_block = os.getenv("DEMO_EXPECT_BLOCK", "false").casefold() == "true"
     # An action paused for review answers only when a reviewer decides: Playwright's
     # default 30 s action timeout would give up first.
-    action_timeout_ms = float(os.getenv("STATELOCK_ACTION_TIMEOUT", "360")) * 1000
+    action_timeout_ms = float(os.getenv("DEMO_ACTION_TIMEOUT", "360")) * 1000
 
     statelock.client.install()  # Playwright's own set_input_files goes through Statelock
     async with (
@@ -55,7 +55,7 @@ async def run_portal_agent() -> None:
                 print("Uploading the remittance (large invoices wait for a reviewer at /review)")
                 await page.set_input_files("#remittance", [remittance])
                 await page.click("text=Mark as Paid")
-                await page.wait_for_selector("text=Reconciliation complete", timeout=2000)
+                await page.wait_for_selector("text=Reconciliation complete", timeout=10_000)
         except StatelockPolicyViolationError as violation:
             if not expect_block:
                 raise

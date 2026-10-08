@@ -10,17 +10,23 @@ them. Same-origin and CORS-allowed URLs only, as for any page request.
 - **Recorded.** Every request is an action record (URL, method, header names,
   body size, status, response size and SHA-256), and it appears in the network
   log as ``statelock_request``.
-- **Declined.** A request no rule allows is answered with an error and recorded
-  (rule ``request_access``). The session continues. Redirects fail before a
-  request to their destination is sent.
+- **One URL.** The URL is put in the form the browser reads it in (``core.urls``)
+  before anything else; a URL that Python and the browser could read differently
+  (a backslash, user info, control characters...) is declined. That one string
+  is checked against the rules, scopes the secrets and is fetched.
+- **Declined.** A request no rule allows, or a malformed one, is answered with
+  an error and recorded (rule ``request_access``). The session continues.
+  Redirects fail before a request to their destination is sent.
 - **Secrets.** Header values may carry ``{{secret:name}}`` placeholders (for
   example an API token). The secrets file must allow the agent, the request URL
   (``url_contains``) and non-password fields (``password_fields_only: false``).
   A placeholder that is not allowed ends the session (rule ``secret_injection``),
-  as in typed input. Every secret the session injected is removed from
-  the response.
+  as in typed input. Every secret the session injected is removed from the whole
+  response (URL, status text, headers, body) and from the record.
 - **Concurrency.** Requests run beside the agent's other commands, so a slow one
-  does not hold up the session.
+  does not hold up the session. At most ``max_concurrent`` run at once
+  (``STATELOCK_MAX_CONCURRENT_REQUESTS``); one more is declined and recorded
+  (rule ``request_concurrency``), and the session continues.
 """
 
 from __future__ import annotations
@@ -29,16 +35,20 @@ import base64
 import binascii
 import hashlib
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from statelock.core.enums import SystemRule
 from statelock.core.jsonutil import as_dict, as_str
+from statelock.core.urls import UrlError, canonical_http_url
 from statelock.core.verdict import PolicyVerdict
 from statelock.credentials import InjectionError, SecretScrubber, SecretStore
 from statelock.policy.requests import RequestAccess
 from statelock.proxy.attribution import REQUEST_SOURCE_URL
 from statelock.proxy.connection import CdpError
+from statelock.proxy.inspector import select_page_target
+from statelock.proxy.js import load_js
 from statelock.proxy.pages import PageSessions
 from statelock.proxy.targets import TargetRegistry
 from statelock.proxy.tasks import BackgroundTasks
@@ -48,50 +58,12 @@ from statelock.wire import statelock_error
 REQUEST_TIMEOUT_SECONDS = 30.0
 MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
 EVALUATE_TIMEOUT = REQUEST_TIMEOUT_SECONDS + 5
-
-# Runs in Statelock's isolated world of the page: the site's own fetch() is untouched
-# there, and the sourceURL attributes the request to Statelock in the network log.
-_FETCH = """
-async ({url, method, headers, body, maxBytes, timeoutMs, redirect}) => {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const init = {method, headers, credentials: "include", redirect, signal: controller.signal};
-    if (body !== null) init.body = Uint8Array.from(atob(body), (c) => c.charCodeAt(0));
-    const response = await fetch(url, init);
-    const reader = response.body ? response.body.getReader() : null;
-    const chunks = [];
-    let size = 0;
-    while (reader) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      size += value.length;
-      if (size > maxBytes) { controller.abort(); return {error: "response_too_large", size}; }
-      chunks.push(value);
-    }
-    let binary = "";
-    for (const chunk of chunks) {
-      for (let i = 0; i < chunk.length; i += 32768) binary += String.fromCharCode(...chunk.subarray(i, i + 32768));
-    }
-    return {
-      status: response.status,
-      statusText: response.statusText,
-      url: response.url,
-      redirected: response.redirected,
-      headers: [...response.headers.entries()],
-      body: btoa(binary),
-    };
-  } catch (error) {
-    return {error: "fetch_failed", message: String(error && error.message || error)};
-  } finally {
-    clearTimeout(timer);
-  }
-}
-"""
+# A declined request's URL is recorded up to this many characters (it was never checked).
+MAX_RECORDED_URL_CHARS = 2048
 
 
 class RequestError(Exception):
-    """A malformed request (answered as an invalid-params error, not recorded as a decision)."""
+    """A malformed request: answered with an error and recorded as declined (rule request_access)."""
 
 
 @dataclass(frozen=True)
@@ -105,8 +77,12 @@ class FetchRequest:
     @classmethod
     def parse(cls, params: dict[str, Any]) -> FetchRequest:
         url = params.get("url")
-        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        if not isinstance(url, str):
             raise RequestError("Statelock.fetch needs an http(s) url")
+        try:
+            url = canonical_http_url(url)
+        except UrlError as error:
+            raise RequestError(f"Statelock.fetch needs a plain http(s) url: {error}") from error
         method = str(params.get("method") or "GET").upper()
         raw_headers = params.get("headers") or {}
         if not isinstance(raw_headers, dict):
@@ -149,6 +125,7 @@ class GovernedRequests:
         agent_id: str,
         secrets: SecretStore,
         scrubber: SecretScrubber,
+        max_concurrent: int = 4,
     ) -> None:
         self.pages = pages
         self.targets = targets
@@ -156,11 +133,36 @@ class GovernedRequests:
         self.agent_id = agent_id
         self.secrets = secrets
         self.scrubber = scrubber
-        self.tasks = BackgroundTasks("governed requests")
+        self.max_concurrent = max_concurrent
+        self._tasks = BackgroundTasks("governed requests")
         self._world = IsolatedWorld(pages, REQUEST_WORLD)
 
     async def close(self) -> None:
-        await self.tasks.close()
+        await self._tasks.close()
+
+    def start(self, payload: dict[str, Any], on_done: Callable[[FetchOutcome], Awaitable[None]]) -> None:
+        """Answer the request in the background (beside the agent's other commands; a request
+        can take up to REQUEST_TIMEOUT_SECONDS), then pass the outcome to ``on_done``."""
+
+        async def run() -> None:
+            await on_done(await self.answer(payload))
+
+        self._tasks.spawn(run())
+
+    def busy(self, payload: dict[str, Any]) -> FetchOutcome | None:
+        """The outcome declining this request when max_concurrent requests are running, else None.
+        Checked before a request is started, so an agent cannot pile up requests and bodies."""
+        running = len(self._tasks)
+        if running < self.max_concurrent:
+            return None
+        url = as_dict(payload.get("params")).get("url")
+        recorded = {"url": url[:MAX_RECORDED_URL_CHARS] if isinstance(url, str) else None, "running": running}
+        reason = (
+            f"Statelock.fetch declined: {running} requests are already running in this session "
+            f"(limit {self.max_concurrent}). Wait for one to finish."
+        )
+        verdict = PolicyVerdict.block(reason=reason, rule=SystemRule.REQUEST_CONCURRENCY.value, evidence=recorded)
+        return FetchOutcome(statelock_error(reason), verdict, recorded)
 
     async def answer(self, payload: dict[str, Any]) -> FetchOutcome:
         try:
@@ -184,25 +186,25 @@ class GovernedRequests:
         if secret_names:
             recorded["statelock_secrets"] = secret_names
         result = await self._fetch(payload, request, headers, rule.max_response_bytes)
+        # Everything below goes to the agent or the evidence: an endpoint may echo a header,
+        # or a value typed earlier, in any part of its answer.
+        scrub = self.scrubber
         if "error" in result:
-            reason = f"Statelock.fetch failed: {result.get('error')} {result.get('message') or ''}".strip()
-            recorded["error"] = result.get("error")
+            message = f"{result.get('error')} {result.get('message') or ''}".strip()
+            reason = scrub.text(f"Statelock.fetch failed: {message}")
+            recorded["error"] = scrub.data(result.get("error"))
             return FetchOutcome(statelock_error(reason), PolicyVerdict.allow(reason, recorded), recorded)
         final_url = str(result.get("url") or request.url)
-        recorded.update(status=result.get("status"), final_url=final_url)
+        recorded.update(status=result.get("status"), final_url=scrub.text(final_url))
         if final_url != request.url and self.access.rule_for(request.method, final_url) is None:
-            reason = f"Statelock.fetch was redirected to {final_url}, which no request_access rule allows."
+            reason = f"Statelock.fetch was redirected to {recorded['final_url']}, which no request_access rule allows."
             return FetchOutcome(statelock_error(reason), _declined(reason, recorded), recorded)
         body = base64.b64decode(str(result.get("body") or ""))
         recorded.update(response_bytes=len(body), response_sha256=hashlib.sha256(body).hexdigest())
-        if self.scrubber:  # an endpoint may echo a header, or a value typed earlier
-            result = {
-                **result,
-                "body": base64.b64encode(self.scrubber.bytes(body)).decode("ascii"),
-                "headers": self.scrubber.data(result.get("headers")),
-            }
+        answer = scrub.data({key: value for key, value in result.items() if key != "body"})
+        answer["body"] = base64.b64encode(scrub.bytes(body)).decode("ascii")
         verdict = PolicyVerdict.allow(f"Request allowed by request_access ({rule.url_pattern})", recorded)
-        return FetchOutcome({"result": result}, verdict, recorded)
+        return FetchOutcome({"result": answer}, verdict, recorded)
 
     def _inject(self, request: FetchRequest) -> tuple[dict[str, str], list[str]]:
         headers: dict[str, str] = {}
@@ -221,7 +223,7 @@ class GovernedRequests:
         self, payload: dict[str, Any], request: FetchRequest, headers: dict[str, str], max_bytes: int
     ) -> dict[str, Any]:
         try:
-            target_id = self.targets.target_for(as_str(payload.get("sessionId"))) or await self._first_page()
+            target_id = self.targets.target_for(as_str(payload.get("sessionId"))) or await self._page()
         except CdpError as error:
             return {"error": "fetch_failed", "message": str(error)}
         if target_id is None:
@@ -235,7 +237,8 @@ class GovernedRequests:
             "timeoutMs": int(REQUEST_TIMEOUT_SECONDS * 1000),
             "redirect": "error",
         }
-        expression = f"({_FETCH})({json.dumps(arguments)})\n//# sourceURL={REQUEST_SOURCE_URL}\n"
+        # The sourceURL attributes the request to Statelock in the network log.
+        expression = f"({load_js('fetch.js')})({json.dumps(arguments)})\n//# sourceURL={REQUEST_SOURCE_URL}\n"
         params = {"expression": expression, "awaitPromise": True, "returnByValue": True}
         try:
             # Not retried after a timeout or a lost context: the request may have been sent.
@@ -245,11 +248,10 @@ class GovernedRequests:
         value = as_dict(as_dict(evaluated.get("result")).get("value"))
         return value or {"error": "fetch_failed", "message": "no result"}
 
-    async def _first_page(self) -> str | None:
-        for target in await self.pages.list_targets():
-            if target.get("type") == "page" and target.get("targetId"):
-                return str(target["targetId"])
-        return None
+    async def _page(self) -> str | None:
+        """For a request on no page's session: a page with a document (not about:blank) if any."""
+        target = select_page_target(await self.pages.list_targets())
+        return str(target["targetId"]) if target is not None else None
 
 
 def _declined(reason: str, evidence: dict[str, Any]) -> PolicyVerdict:

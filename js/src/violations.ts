@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /** Violation errors and the lookup of a session's violation. */
 
-import { SessionUrlError, call } from "./sessions.js";
+import { StatelockClientError, call } from "./http.js";
 
 export const VIOLATION_MARKER = "STATELOCK_POLICY_VIOLATION";
 const LOOKUP_TIMEOUT_MS = 2_000;
@@ -91,7 +91,7 @@ export function decodeViolation(message: string): Violation | null {
 
 /**
  * GET /violations/<session_id>: the recorded violation, or null when there is none (404).
- * Any other failure (a wrong key, a server error, no answer) throws SessionUrlError:
+ * Any other failure (a wrong key, a server error, no answer) throws StatelockClientError:
  * it does not mean the session had no violation. apiKey defaults to STATELOCK_API_KEY.
  */
 export async function fetchViolation(
@@ -105,7 +105,7 @@ export async function fetchViolation(
     const payload = await call("GET", path, { serverUrl: origin, apiKey }, undefined, LOOKUP_TIMEOUT_MS);
     return Object.keys(payload).length ? (payload as Violation) : null;
   } catch (error) {
-    if (error instanceof SessionUrlError && error.status === 404) return null;
+    if (error instanceof StatelockClientError && error.status === 404) return null;
     throw error;
   }
 }
@@ -118,6 +118,25 @@ function mayBeViolation(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const text = `${error.name}: ${error.message}`;
   return error.name === "TargetClosedError" || text.includes(VIOLATION_MARKER) || CLOSED_TEXTS.some((t) => text.includes(t));
+}
+
+/** Errors that carry the record Statelock keeps (GET /violations): guard() does not look them up again. */
+const recorded = new WeakSet<StatelockPolicyViolationError>();
+
+function recordedError(violation: Violation, cause?: unknown): StatelockPolicyViolationError {
+  const error = new StatelockPolicyViolationError(violation, cause === undefined ? undefined : { cause });
+  recorded.add(error);
+  return error;
+}
+
+/** session.violation(): the recorded violation as an error, or null (see fetchViolation). */
+export async function lookupViolation(
+  serverUrl: string,
+  sessionId: string,
+  apiKey?: string,
+): Promise<StatelockPolicyViolationError | null> {
+  const found = await fetchViolation(serverUrl, sessionId, apiKey);
+  return found ? recordedError(found) : null;
 }
 
 export interface GuardOptions {
@@ -135,7 +154,8 @@ export interface GuardOptions {
 /**
  * Run fn and turn errors caused by a Statelock violation into StatelockPolicyViolationError.
  * Other errors (timeouts, missing elements) pass through unchanged, without a lookup.
- * A lookup Statelock refuses (a wrong key) throws SessionUrlError.
+ * A lookup Statelock refuses (a wrong key) throws StatelockClientError, except when the
+ * violation is already known (a blocked download): then that violation is thrown.
  */
 export async function guard<T>(fn: () => Promise<T>, options: GuardOptions = {}): Promise<T> {
   const { serverUrl, sessionId, apiKey } = options;
@@ -157,7 +177,7 @@ export async function guard<T>(fn: () => Promise<T>, options: GuardOptions = {})
             }
             if (stopped) return;
             if (violation) {
-              reject(new StatelockPolicyViolationError(violation));
+              reject(recordedError(violation));
               return;
             }
             schedule();
@@ -178,17 +198,19 @@ export async function guard<T>(fn: () => Promise<T>, options: GuardOptions = {})
     return await (watched ? Promise.race([fn(), watched]) : fn());
   } catch (error) {
     if (error instanceof StatelockPolicyViolationError) {
-      // Raised by an SDK helper (a blocked download): complete it with the recorded violation.
+      // The watcher's error already is the record. One raised by an SDK helper (a blocked
+      // download) is completed with it; if that lookup fails, the known violation stands.
       const lookupId = sessionId ?? error.sessionId ?? undefined;
-      const details = serverUrl && lookupId ? await fetchViolation(serverUrl, lookupId, apiKey) : null;
-      throw details ? new StatelockPolicyViolationError({ ...error.violation, ...details }, { cause: error }) : error;
+      if (recorded.has(error) || !serverUrl || !lookupId) throw error;
+      const details = await fetchViolation(serverUrl, lookupId, apiKey).catch(() => null);
+      throw details ? recordedError({ ...error.violation, ...details }, error) : error;
     }
     if (!mayBeViolation(error)) throw error;
     let violation: Violation = decodeViolation(String((error as Error).message)) ?? {};
     const lookupId = sessionId ?? (violation.session_id || undefined);
     if (serverUrl && lookupId) {
       const details = await fetchViolation(serverUrl, lookupId, apiKey);
-      if (details) violation = { ...violation, ...details };
+      if (details) throw recordedError({ ...violation, ...details }, error);
     }
     if (!Object.keys(violation).length) throw error;
     throw new StatelockPolicyViolationError(violation, { cause: error });

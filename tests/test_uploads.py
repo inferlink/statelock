@@ -4,14 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from statelock.proxy.uploads import (
-    BEGIN_METHOD,
-    CHUNK_METHOD,
-    END_METHOD,
-    SessionUploads,
-    UploadError,
-    safe_file_name,
-)
+from statelock.proxy.uploads import SessionUploads, UploadError, safe_file_name
+from statelock.wire import UPLOAD_BEGIN_COMMAND, UPLOAD_CHUNK_COMMAND, UPLOAD_END_COMMAND
 
 
 def _uploads(tmp_path: Path, max_file: int = 1000, max_session: int = 1500) -> SessionUploads:
@@ -19,12 +13,13 @@ def _uploads(tmp_path: Path, max_file: int = 1000, max_session: int = 1500) -> S
 
 
 def _upload(store: SessionUploads, name: str, data: bytes, chunk: int = 3) -> dict:
-    upload_id = store.handle(BEGIN_METHOD, {"name": name, "mimeType": "text/plain"})["uploadId"]
+    upload_id = store.handle(UPLOAD_BEGIN_COMMAND, {"name": name, "mimeType": "text/plain"})["uploadId"]
     for offset in range(0, len(data), chunk):
         store.handle(
-            CHUNK_METHOD, {"uploadId": upload_id, "data": base64.b64encode(data[offset : offset + chunk]).decode()}
+            UPLOAD_CHUNK_COMMAND,
+            {"uploadId": upload_id, "data": base64.b64encode(data[offset : offset + chunk]).decode()},
         )
-    return store.handle(END_METHOD, {"uploadId": upload_id})
+    return store.handle(UPLOAD_END_COMMAND, {"uploadId": upload_id})
 
 
 def test_chunked_upload_is_stored_hashed_and_resolvable(tmp_path: Path) -> None:
@@ -46,7 +41,7 @@ def test_only_uploaded_paths_resolve(tmp_path: Path) -> None:
     outside.write_text("x")
     with pytest.raises(UploadError, match="was not uploaded"):
         store.resolve([str(outside)])
-    upload_id = store.handle(BEGIN_METHOD, {"name": "a.txt"})["uploadId"]
+    upload_id = store.handle(UPLOAD_BEGIN_COMMAND, {"name": "a.txt"})["uploadId"]
     pending_path = next(tmp_path.glob(f"statelock-uploads-*/{upload_id}/a.txt"))
     with pytest.raises(UploadError):
         store.resolve([str(pending_path)])  # not finished
@@ -72,11 +67,11 @@ def test_limits_and_bad_input(tmp_path: Path) -> None:
     _upload(store, "a.bin", b"12345")
     with pytest.raises(UploadError, match="session exceeds"):
         _upload(store, "b.bin", b"1234")
-    upload_id = store.handle(BEGIN_METHOD, {"name": "c.bin"})["uploadId"]
+    upload_id = store.handle(UPLOAD_BEGIN_COMMAND, {"name": "c.bin"})["uploadId"]
     with pytest.raises(UploadError, match="base64"):
-        store.handle(CHUNK_METHOD, {"uploadId": upload_id, "data": "!!!"})
+        store.handle(UPLOAD_CHUNK_COMMAND, {"uploadId": upload_id, "data": "!!!"})
     with pytest.raises(UploadError, match="unknown uploadId"):
-        store.handle(END_METHOD, {"uploadId": "nope"})
+        store.handle(UPLOAD_END_COMMAND, {"uploadId": "nope"})
     with pytest.raises(UploadError, match="unknown Statelock command"):
         store.handle("Statelock.somethingElse", {})
 

@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from statelock import __main__ as cli
 from statelock.app import create_app
 from statelock.plugins import PluginContext, discover_plugins, setup_plugins
 from statelock.services import Services
@@ -93,3 +94,28 @@ def test_discover_plugins_selection() -> None:
     assert discover_plugins("none") == []
     with pytest.raises(RuntimeError, match="not installed"):
         discover_plugins("definitely_missing_plugin")
+
+
+def test_cli_serves_on_the_documented_port_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict] = []
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *_args, **kwargs: calls.append(kwargs))
+    assert cli.main([]) == 0
+    assert (calls[0]["host"], calls[0]["port"]) == ("127.0.0.1", 8010)
+    assert cli.main(["--host", "0.0.0.0", "--port", "9000"]) == 0  # noqa: S104 - an argument, not a bind
+    assert (calls[1]["host"], calls[1]["port"]) == ("0.0.0.0", 9000)  # noqa: S104
+
+
+def test_cli_help_describes_host_and_port(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    help_text = capsys.readouterr().out
+    assert "address the proxy listens on" in help_text and "port the proxy listens on (default: 8010)" in help_text
+
+
+def test_startup_settings_for_chromium_and_requests_are_bounded(policy_file: Path, tmp_path: Path) -> None:
+    services = Services.from_settings(
+        _settings(policy_file, tmp_path, chromium_start_timeout=3, max_concurrent_requests=2)
+    )
+    assert services.launcher.start_timeout == 3
+    with pytest.raises(ValueError, match="max_concurrent_requests"):
+        Settings(max_concurrent_requests=0)

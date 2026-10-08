@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """`statelock` command.
 
-statelock [--host H] [--port P]            run the proxy (default)
+statelock [--host H] [--port P]            run the proxy (default: 127.0.0.1:8010)
 statelock keygen --agent-id ID [--tenant T] [--append FILE]  new API key and its keys-file entry
                                            (or --reviewer / --auditor ID)
 statelock session-url [--saved-session NAME [--save]]  single-use URL for a governed session
@@ -24,10 +24,11 @@ from typing import Any
 
 import uvicorn
 import yaml
-from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 from statelock.auth import DEFAULT_TENANT, KeysFile, generate_key, hash_key
 from statelock.fileio import load_yaml, write_atomic
+
+DEFAULT_PORT = 8010  # the port the README and the examples use
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -65,48 +66,44 @@ def append_key_entry(path: Path, section: str, entry: dict[str, Any]) -> None:
     of the file as written, comments included. The result must be a valid keys file;
     it replaces the old one atomically."""
     text = path.read_text(encoding="utf-8") if path.exists() else ""
-    before = KeysFile.model_validate(load_yaml(text) or {})
+    before = load_yaml(text) or {}
+    KeysFile.model_validate(before)
     updated = _insert_entry(text, section, yaml.safe_dump([entry], sort_keys=False))
     after = load_yaml(updated) or {}
     KeysFile.model_validate(after)  # also refuses a key that is already listed
-    entries = after.get(section) or []
-    if entry not in entries or len(entries) != len(getattr(before, section)) + 1:
+    # Exactly one change: the entry appended to its section.
+    if {**after, section: None} != {**before, section: None} or after.get(section) != [
+        *(before.get(section) or []),
+        entry,
+    ]:
         raise ValueError("the entry could not be added; add it by hand")
     mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
     write_atomic(path, updated.encode("utf-8"), mode=mode)
 
 
 def _insert_entry(text: str, section: str, item: str) -> str:
-    """``text`` with the YAML list ``item`` added to the top-level ``section`` list."""
-    root = yaml.compose(text) if text.strip() else None
-    if root is not None and not isinstance(root, MappingNode):
-        raise ValueError("the keys file is not a mapping")
-    pairs = root.value if root else []
-    value = next((v for k, v in pairs if isinstance(k, ScalarNode) and k.value == section), None)
-    if value is None:  # no such section yet: add it at the end
-        prefix = text if not text or text.endswith("\n") else text + "\n"
-        return f"{prefix}{section}:\n{_indent(item, '  ')}"
-    if not isinstance(value, SequenceNode) or value.flow_style or not value.value:
+    """``text`` with the YAML list ``item`` added at the end of the top-level ``section`` list,
+    or a new section at the end. Plain text insertion: the caller parses the result and checks
+    that it holds exactly the one new entry."""
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    start = next((i for i, line in enumerate(lines) if line.startswith(f"{section}:")), None)
+    if start is None:
+        return "".join(lines) + f"{section}:\n{_indent(item, '  ')}"
+    value = lines[start][len(section) + 1 :].strip()
+    if value and not value.startswith("#"):
         raise ValueError(f"{section} must be a block list (- entries) to append to; add the entry by hand")
-    # Indent like the first entry; insert on the line after the last one (before any
-    # comment that introduces the next section).
-    first = value.value[0].start_mark
-    line_start = text.rfind("\n", 0, first.index) + 1
-    indent = text[line_start : first.index].partition("-")[0]
-    if indent.strip() or "-" not in text[line_start : first.index]:
-        raise ValueError(f"{section}: the first entry is not written as '- key: value'; add the entry by hand")
-    line_end = text.find("\n", _content_end(value.value[-1]))
-    if line_end < 0:
-        return f"{text}\n{_indent(item, indent)}"
-    return f"{text[: line_end + 1]}{_indent(item, indent)}{text[line_end + 1 :]}"
-
-
-def _content_end(node: Node) -> int:
-    """Where the text of a node ends (a block collection's own end mark lies past its trailing comments)."""
-    while isinstance(node, (MappingNode, SequenceNode)) and not node.flow_style and node.value:
-        last = node.value[-1]
-        node = last[1] if isinstance(node, MappingNode) else last
-    return int(node.end_mark.index)
+    # The section runs until the next top-level key; a comment after its last entry (one that
+    # introduces the next section) stays after the new entry.
+    end = start + 1
+    while end < len(lines) and (not lines[end].strip() or lines[end][0] in " #-"):
+        end += 1
+    while end > start + 1 and (not lines[end - 1].strip() or lines[end - 1].lstrip().startswith("#")):
+        end -= 1
+    entries = [line for line in lines[start + 1 : end] if line.lstrip().startswith("-")]
+    indent = entries[0][: len(entries[0]) - len(entries[0].lstrip())] if entries else "  "
+    return "".join([*lines[:end], _indent(item, indent), *lines[end:]])
 
 
 def _indent(block: str, indent: str) -> str:
@@ -114,7 +111,7 @@ def _indent(block: str, indent: str) -> str:
 
 
 def _session_url(args: argparse.Namespace) -> int:
-    from statelock.client.sessions import SessionUrlError, create_session_url  # noqa: PLC0415
+    from statelock.client.sessions import StatelockClientError, create_session_url  # noqa: PLC0415
 
     try:
         url = create_session_url(
@@ -124,7 +121,7 @@ def _session_url(args: argparse.Namespace) -> int:
             saved_session=args.saved_session,
             save_session=args.save,
         )
-    except SessionUrlError as error:
+    except StatelockClientError as error:
         print(error, file=sys.stderr)
         return 1
     print(url.ws_url if args.ws else url.cdp_url)
@@ -134,7 +131,7 @@ def _session_url(args: argparse.Namespace) -> int:
 
 def _saved_sessions(args: argparse.Namespace) -> int:
     from statelock.client.sessions import (  # noqa: PLC0415
-        SessionUrlError,
+        StatelockClientError,
         delete_saved_session,
         list_saved_sessions,
     )
@@ -149,7 +146,7 @@ def _saved_sessions(args: argparse.Namespace) -> int:
             return 0 if deleted else 1
         for name in list_saved_sessions(args.server, agent_id=args.agent_id):
             print(name)
-    except SessionUrlError as error:
+    except StatelockClientError as error:
         print(error, file=sys.stderr)
         return 1
     return 0
@@ -165,13 +162,14 @@ def _hash_key(_args: argparse.Namespace) -> int:
 
 
 def _check_sandbox(_args: argparse.Namespace) -> int:
-    from statelock.proxy.browser import BrowserLaunchError, ChromiumCdpLauncher  # noqa: PLC0415 - heavy import
+    from statelock.proxy.browser import BrowserLaunchError  # noqa: PLC0415 - heavy import
+    from statelock.services import launcher  # noqa: PLC0415
     from statelock.settings import Settings  # noqa: PLC0415
 
     settings = Settings()
 
     async def launch() -> None:
-        browser = await ChromiumCdpLauncher(host=settings.chromium_host, sandbox=settings.chromium_sandbox).launch()
+        browser = await launcher(settings).launch()
         await browser.close()
 
     try:
@@ -216,8 +214,12 @@ def _perception_check(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="statelock", description="Statelock proxy and tools.")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="address the proxy listens on (default: 127.0.0.1, this machine only)"
+    )
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help=f"port the proxy listens on (default: {DEFAULT_PORT})"
+    )
     parser.set_defaults(handler=_run)
     commands = parser.add_subparsers(title="commands")
 

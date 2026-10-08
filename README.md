@@ -1,6 +1,10 @@
 # Statelock
 
-Statelock adds policy checks and evidence to AI browser automation. It is a Chrome DevTools Protocol (CDP) proxy between your agent (Playwright, browser-use, Stagehand, LangChain or any CDP client) and a headless Chromium. Before each click, keystroke, upload or download it captures the page and checks your policy; it releases or blocks the action; after commit actions it checks post-conditions; and it records evidence for every decision. An agent can then work in a real web portal inside clear limits: it may decline a manuscript but not send it to review, or mark an invoice as paid only when the bank deposit matches.
+Statelock adds policy checks and evidence to AI browser automation. It is a Chrome DevTools Protocol (CDP) proxy between your agent (Playwright, browser-use, Stagehand, LangChain or any CDP client) and a headless Chromium.
+
+Before each click, keystroke, upload or download, Statelock captures the page and checks your policy, then releases or blocks the action. After a commit action it checks post-conditions. It records evidence for every decision.
+
+An agent can then work in a real web portal inside clear limits: it may decline a manuscript but not send it to review, or mark an invoice as paid only when the bank deposit matches.
 
 ## Quick start
 
@@ -66,29 +70,31 @@ For sync Playwright, browser-use, LangChain, CrewAI, Stagehand and JavaScript ag
 From a checkout of this repository, start the development proxy and run the two finance cases. The development stack supplies demo keys and enables the demo pages; no local Python installation or key generation is needed.
 
 ```bash
+cp .env.example .env   # compose.yaml reads it (env_file); the defaults are fine
 docker compose -f compose.yaml -f compose.dev.yaml up -d --build statelock
 docker compose -f compose.yaml -f compose.dev.yaml --profile finance-agent run --rm finance-agent
 docker compose -f compose.yaml -f compose.dev.yaml --profile finance-pass-agent run --rm finance-pass-agent
 ```
 
-The first agent is blocked because the deposit is $4,900 and the invoice is $5,000; the second completes when they match. The rule is in [policies/default.yaml](policies/default.yaml), under `finance_reconciliation_agent`: it compares `bank_deposit_amount` with `erp_invoice_amount` before the action and checks for "Reconciliation complete" afterward. See [Policies](#policies) to write your own.
+The first agent is blocked because the deposit is $4,900 and the invoice is $5,000; the second completes when they match. The rule is in [policies/default.yaml](https://github.com/inferlink/statelock/blob/main/policies/default.yaml), under `finance_reconciliation_agent`: it compares `bank_deposit_amount` with `erp_invoice_amount` before the action and checks for "Reconciliation complete" afterward. See [Policies](#policies) to write your own.
 
-For the test suite, base-proxy Docker setup and other demos, see [Development](#development), [compose.dev.yaml](compose.dev.yaml) and the [OJS walkthrough](examples/ojs/README.md).
+For the test suite, base-proxy Docker setup and other demos, see [Development](#development), [compose.dev.yaml](https://github.com/inferlink/statelock/blob/main/compose.dev.yaml) and the [OJS walkthrough](https://github.com/inferlink/statelock/blob/main/examples/ojs/README.md).
 
 ## How it works
 
 1. **Admission.** The agent connects with a single-use session URL, or to `ws://<host>/statelock` with `Authorization: Bearer <key>`, `x-statelock-agent-id` (optional; it must match the key), and optionally `x-statelock-session-id` (a UUID). A missing, unknown, disabled or expired key, a key for another agent, or an agent without a policy is refused (`4401`), as are invalid or reused session IDs (`4409`).
-2. **Governed Chromium.** Each session gets its own Chromium, started with a minimal environment. CDP is forwarded in both directions; only valid JSON is forwarded, exactly as Statelock evaluated it. Commands that would bypass governance are refused:
+2. **Governed Chromium.** Each session gets its own Chromium, started with a minimal environment. CDP runs over a pipe (`--remote-debugging-pipe`), so there is no DevTools port a page could reach. CDP is forwarded in both directions; only valid JSON is forwarded, exactly as Statelock evaluated it. Commands that would bypass governance are refused:
    - wrapped commands (`Target.sendMessageToTarget`) and `Debugger.setScriptSource`;
    - loading anything but an http(s) URL or `about:blank` (`javascript:`, `file:`, `data:`, `blob:`, `chrome:`, `view-source:`);
    - `Target.exposeDevToolsProtocol`, `Network.replayXHR` and `Page.setDocumentContent`;
    - commands that reach Statelock's own isolated worlds;
-   - agent network interception (`page.route`, any `Fetch.*`).
+   - agent network interception (`page.route`, any `Fetch.*`), agent-selected browser proxies and certificate-error overrides.
 3. **Page guard.** Installed on every page and iframe before the agent's commands reach it. On governed pages (URLs your policies cover) it:
    - cancels synthetic clicks, submits, drops and pastes (`element.click()`, `dispatch_event`);
    - clears files that code puts into file inputs (including Playwright's own `set_input_files` over remote CDP; `statelock.client.install()` routes it through Statelock, see [Files](https://github.com/inferlink/statelock/blob/main/README.md#files));
    - blocks page loads and requests started by the agent's own page code;
-   - blocks `form.submit()` called from code.
+   - blocks form submissions code makes (`form.submit()`, and `form.requestSubmit()` outside a real click, Enter or touch);
+   - also guards the page's iframes (srcdoc, about:blank and other origins), like the page.
 4. **Governed input.** For each input command (mouse, key, text, touch, drag and drop, IME, gestures, and `DOM.setFileInputFiles`) Statelock:
    - captures state from the command's tab, in its own isolated world: URL, text, the element under the pointer or focused, fields, accessibility tree, screenshot;
    - evaluates pre-conditions;
@@ -125,13 +131,13 @@ policies:
       names: [csrftoken]                        # exact names; or domains: [...]; or all: true
 ```
 
-`target_url_contains` matches the page URL as `scheme://host[:port]/path`, without query, fragment or user info.
+`target_url_contains` matches the page URL as `scheme://host[:port]/path`, without query, fragment or user info. A path-only scope matches as a substring. An absolute scope (`https://host/path`) needs that exact origin and a path equal to its path or below it.
 
 A `trigger` limits an entry to particular actions. It goes in the entry beside the rule, not inside the rule's options. On a pre-condition it runs only when an element whose text or aria-label contains a `click_text` value is activated (pressed, touched, tapped, dropped on, or Enter/Space while focused), or on the key down of a listed `key`: it checks the page just before the button acts. On a post-condition it runs after that action, on the page it led to. Without a trigger, pre-conditions run on every action on the policy's pages and post-conditions after every click or Enter. An unresolved click target counts as a match (fail closed). `restrict_uploads` and `restrict_downloads` take no trigger.
 
-`id` names the policy in verdicts, violations and the evidence (`policy_id`), so with several policies for one agent the record says which one blocked. Without it the id is `<agent_id>#<n>`: the agent's n-th policy in the file (so reordering the file renames the defaults; set `id` where it matters). Ids are unique in the file.
+`id` names the policy in verdicts, violations and the evidence (`policy_id`), so with several policies for one agent the record says which one blocked. Without it the id is `<agent_id>#<n>`: the agent's n-th policy across the loaded policy files, in load order (so reordering policies renames the defaults; set `id` where it matters). Ids are unique across all loaded policy files.
 
-`cookie_access` applies to the agent (the union of its policies). Statelock returns only the listed cookies to `context.cookies()`, `storage_state()` and `page.request`, and records their names, never their values. `all: true` hands over the site's session cookies, which lets agent-side HTTP act as the user outside Statelock; use it knowingly.
+`cookie_access` applies to the agent (the union of its policies). Cookies are not exported by default: with the site's session cookies, Playwright's `page.request` / `context.request` (without `install()`) or another HTTP client would act as the logged-in user outside Statelock. So Statelock answers cookie reads over CDP (`context.cookies()`, `storage_state()`) with only the cookies `cookie_access` allows. With no `cookie_access`, the read is declined (`cookie_export`), so those calls fail instead of bypassing Statelock, and the session continues. Either way the read is recorded, with cookie names, never values. `all: true` hands over the site's session cookies, which lets agent-side HTTP act as the user outside Statelock; use it knowingly. For HTTP, use [`request_access`](#agent-side-http-request_access): after `install()`, `page.request` goes through Statelock.
 
 A policy, keys or secrets file with a repeated key at any level (two `pre_conditions:`, two `agents:` sections) is refused when it loads.
 
@@ -141,9 +147,9 @@ An agent that needs HTTP (a site's JSON API, a file behind a link) can have Stat
 
 ```yaml
     request_access:                             # optional; default: no requests
-      - url_pattern: "^https://portal\\.example\\.com/api/"   # regex searched in the full URL
+      - url_pattern: "^https://portal\\.example\\.com/api/"   # regex matched from the start of the URL
         methods: [GET, POST]                    # default [GET]
-        max_response_bytes: 5000000             # default 8 MB, at most 11 MB
+        max_response_bytes: 5000000             # default 8 MiB, at most 11 MiB
 ```
 
 ```python
@@ -152,13 +158,14 @@ invoices = await (await page.request.get("https://portal.example.com/api/invoice
 # or without install(): await statelock_fetch(page, url, method="POST", data={...})
 ```
 
-- **Patterns.** `url_pattern` must start with `^https://`, `^http://` or `^https?://`, then a literal host (escape dots as `\.`) and `/`. Wildcard hosts are rejected.
+- **Patterns.** `url_pattern` must start with `^https://`, `^http://` or `^https?://`, then a literal host (escape dots as `\.`), an optional port (`:8443`, or `:[0-9]+` for any) and `/`. It is matched from the start of the URL, and the URL must also begin with exactly that `scheme://host[:port]/`: no user info, and no port the pattern does not name. Wildcard hosts and `|` outside a group are rejected.
+- **URLs.** Statelock writes the URL as the browser reads it (lowercase scheme and host, no default port, no fragment) and checks, scopes and fetches that one string. A URL that Python and the browser could read differently is declined (`request_access`): spaces, control or non-ASCII characters, backslashes, user info (`user@host`), `.`/`..` path segments, IPv4 addresses not written as `a.b.c.d`, invalid ports and IPv6 zone ids.
 - **Where it runs.** Statelock makes the request with `fetch()` in an isolated world of the page, as the site's own code would, so only same-origin or CORS-allowed URLs work. The browser's cookies go with it; the agent never receives them.
 - **Recorded.** Each request is an action record: URL, method, header names, body size, status, and the response's size and SHA-256. It shows as `statelock_request` in the network log.
 - **Declined.** A request no rule allows is answered with an error (`request_access`, `StatelockRequestError`) and recorded. The session continues.
 - **Redirects.** They fail before the destination request is sent. `follow_redirects: true` is rejected during policy validation because the destination cannot be checked before the browser follows it.
 - **Secrets.** Header values may use `{{secret:name}}` (for example `Authorization: Bearer {{secret:api_token}}`). The secret needs `password_fields_only: false`, and the request URL must be in its scope (see [Credentials](https://github.com/inferlink/statelock/blob/main/README.md#credentials)). A placeholder that is not allowed ends the session (`secret_injection`), and the value is removed from the response if the endpoint echoes it.
-- **Concurrent.** A request runs alongside the agent's other commands.
+- **Concurrent.** A request runs alongside the agent's other commands, at most `STATELOCK_MAX_CONCURRENT_REQUESTS` (4) at once per session. One more is declined (`request_concurrency`, `StatelockRequestError`) and recorded; the session continues.
 - **Not supported** through `page.request`: `multipart`, `max_redirects`, `max_retries`, `ignore_https_errors`.
 
 ### Fields and remembered values
@@ -187,10 +194,10 @@ Rules read named fields. A field is either `data-statelock-key` / `data-stateloc
       - restrict_uploads: {extensions: [.pdf], max_bytes: 5000000, max_files: 1}
 ```
 
-A field reads one of: `selector` (the first match's text, or `attribute`), `key` (`data-statelock-key` markup), or `from_url: true` (the page URL; use `pattern`). A policy field is read only as the policy defines it, never from markup of the same name. `url_contains` matches like `target_url_contains`. Selector fields also take:
+A field reads one of: `selector` (the first match's text, or `attribute`), `key` (`data-statelock-key` markup), or `from_url: true` (the page URL; use `pattern`). A policy field is read only as the policy defines it, never from markup of the same name. `data-statelock-value` applies only to `data-statelock-key` fields; a selector field reads what the page shows. `url_contains` matches like `target_url_contains`. Selector fields also take:
 
 - `frame`: a same-origin iframe to look in (a rich-text editor's body, say);
-- `visible: true`: only elements that are shown;
+- `visible: true`: only elements that are shown: rendered (not `display: none`, `visibility: hidden`, `opacity: 0` or hidden content, itself or an ancestor), with a box larger than a pixel that is not left of or above the page (below the fold counts);
 - `read: count` (how many elements match, `0` for none) or `read: length` (characters of the value). A password field is never read; `read: length` is the only thing Statelock takes from one.
 
 `remembered.<name>` is the latest value of a `remember: true` field seen anywhere in the session (any tab). A remembered field must name trusted origins with `allowed_origins`, or use an absolute `url_contains` scope; a path alone could be copied on another site. Statelock captures it at each governed action, when a matching page finishes loading (and again 0.5 s later), and before the agent navigates away (goto, reload, back/forward). Each action record stores the remembered values with their URL, source and time, and a rule that needs a missing value blocks.
@@ -199,18 +206,18 @@ Built-in rules:
 
 | Rule | Where it can be used | What it checks |
 |---|---|---|
-| `require_page_text` | pre and post | The page text contains each listed value. |
-| `prohibit_page_text` | pre and post | The page text contains none of the listed values (an error message, a login form after logging in). |
-| `assert_field_equal` | pre and post | Two fields (or remembered values) hold the same value, or a field equals a fixed `value`. Numbers compare as numbers; text compares after Unicode NFKC and case folding, ignoring only whitespace and punctuation. Amounts in different currency symbols or currency codes are never equal. |
+| `require_page_text` | pre and post | The page text contains each listed value. Text is compared after Unicode NFKC and case folding, ignoring invisible characters (soft hyphen, zero-width space) and differences in whitespace. |
+| `prohibit_page_text` | pre and post | The page text contains none of the listed values (an error message, a login form after logging in), compared like `require_page_text` and also ignoring spaces altogether ("MarkasPaid" matches "Mark as Paid"). Blocks if the page text was cut short or parts of the page could not be read. |
+| `assert_field_equal` | pre and post | Two fields (or remembered values) hold the same value, or a field equals a fixed `value`. Numbers compare as numbers; text compares after Unicode NFKC and case folding, ignoring only whitespace and punctuation (punctuation between digits and a leading minus are kept). Amounts in different currencies are never equal: ISO 4217 codes (upper case, next to the amount) and symbols are compared ("€5" equals "5 EUR"), and "$" or "¥" alone is not taken as any one code ("$5" does not equal "USD 5"; "US$5" does). |
 | `assert_compare` | pre and post | A numeric comparison (`<`, `<=`, `>`, `>=`, `==`, `!=`) of a field with another field (`right`) or a constant (`value`). |
-| `prohibit_click_text` | pre only | The clicked or touched element, or the focused element for Enter/Space, does not contain a listed text. |
+| `prohibit_click_text` | pre only | The clicked or touched element, or the focused element for Enter/Space, does not contain a listed text. Text is compared like `require_page_text`. |
 | `restrict_downloads` | pre only | Downloads the page starts: allowed `extensions`, `name_pattern`, source `url_pattern` and `max_downloads` (per session) when the download begins; `max_bytes` when it completes. A blocked download is cancelled or deleted and ends the session. |
 | `restrict_uploads` | pre only | Governed uploads: allowed `extensions`, `max_bytes` per file, `max_files` per upload, `name_pattern`. Other actions pass. |
 | `visual_assert` | pre and post | A vision-language model judges the screenshot and can read values off it; `cross_check` compares those with page fields. Fails closed (see below). |
 
-- **Text rules.** `require_page_text`, `prohibit_page_text` and `prohibit_click_text` need at least one non-empty value.
-- **Numbers.** `$5,000.00`, `-$5`, `$-5`, `−5` (Unicode minus) and `(1,234.00)` (negative) parse. Ambiguous formats such as `5.000,00`, `5-` or `12.50)` do not, and the rule blocks.
-- **Loading.** Entries with zero or several rules, unknown rules, and unknown fields are rejected when the policy file loads. A rule that raises or does not answer within its time limit (30 s by default) blocks the action.
+- **Text rules.** `require_page_text`, `prohibit_page_text` and `prohibit_click_text` need at least one value with visible characters.
+- **Numbers.** `$5,000.00`, `-$5`, `$-5`, `−5` (Unicode minus) and `(1,234.00)` (negative) parse. Ambiguous formats such as `5.000,00`, `5-` or `12.50)` do not, and the rule blocks. Amounts are compared exactly, at any length.
+- **Loading.** Entries with zero or several rules, unknown rules, and `remembered.<name>` references to a name that is not a `remember: true` field of the agent are rejected when the policy file loads. Other field names cannot be checked then (a page can supply them with `data-statelock-key`); a missing field blocks at runtime. A rule that raises or does not answer within its time limit (30 s by default) blocks the action.
 
 ### Custom rules
 
@@ -272,7 +279,8 @@ Statelock loads rule modules at startup from the `statelock.rules` entry point g
 - **Cross-checks.** A model can misread or be fooled by the page. `cross_check` compares each value it read with a DOM field (numbers as numbers), so a visual check can back up, not replace, a deterministic one.
 - **Cost.** One model call per checked action: pre-conditions check activations only unless `when: all`. The same screenshot and question are answered from a cache. The agent's action waits for the model, so set its action timeouts above `STATELOCK_PERCEPTION_TIMEOUT`.
 - **Evidence.** The action record has the model's verdict, what it read, the model name, attempts and latency (`evidence.perception`, `evidence.cross_check`).
-- **Try a model:** `statelock perception-check screenshot.jpg -i "The amounts match." -x bank_deposit=string`. `tests/test_perception_model.py` runs the finance fixtures (`tests/fixtures/perception`) against the configured model.
+- **Try a model:** `statelock perception-check screenshot.jpg -i "The amounts match." -x bank_deposit=string`. `tests/test_perception_model.py` runs the finance fixtures (`tests/fixtures/perception`) against the configured model and prints its answers; it checks that they have the expected form and are correct (`PERCEPTION_CHECK_ANSWERS=false` checks the form only).
+- **Try a local model in Docker:** the `vlm` profile in `compose.dev.yaml` runs Ollama with `DEMO_VLM_MODEL` (default `qwen2.5vl:3b`) and runs that test against it (see [Development](#development)). It prints the answers and checks only their form, because a 3B model can misjudge; set `DEMO_VLM_CHECK_ANSWERS=true` in `.env` to also require correct answers.
 
 ### Human review
 
@@ -362,9 +370,9 @@ except StatelockPolicyViolationError as violation:
     print(violation.rule, violation.reason)
 ```
 
-The guard looks the violation up with the key the session was created with (else `STATELOCK_API_KEY`). If Statelock refuses that key or cannot be reached, it raises `SessionUrlError` (with `status`) instead of reporting no violation.
+The guard looks the violation up with the key the session was created with (else `STATELOCK_API_KEY`). If Statelock refuses that key or cannot be reached, it raises `StatelockClientError` (with `status`) instead of reporting no violation.
 
-The sync API has the same names ending in `_sync` / `Sync`:
+The sync API has the same names ending in `_sync` / `Sync` (`install_sync`, `connect_playwright_sync`, `statelock_guard_sync`, `expect_download_sync`, ...). `statelock_fetch` is async only; `create_session_url` and the saved-session functions are plain blocking calls that both APIs use:
 
 ```python
 import statelock.client
@@ -375,6 +383,8 @@ with statelock.client.connect_playwright_sync(playwright) as governed, governed.
 ```
 
 Under the hood, Statelock uses a CDP browser URL. Any framework that takes such a URL (Playwright, Puppeteer, browser-use, Stagehand, LangChain or CrewAI browser tools) can use one.
+
+Naming: a *session* is one governed browser session. `SessionUrl` is the single-use URL that opens one, `PlaywrightSession` is that session with its connected Playwright browser, `statelock_session(page)` returns the `{session_id, agent_id}` of the page's session (None for a browser not behind Statelock), and a *saved session* is a stored browser login that a new session can restore.
 
 ### Session URLs
 
@@ -398,8 +408,8 @@ async with session.guard():                                      # session.viola
 - **Two forms:** `cdp_url` is an http URL; frameworks read the WebSocket address from its `/json/version`. `ws_url` is the WebSocket itself.
 - **The token:** it identifies the agent and the session. It is used up when the browser connects and expires after `STATELOCK_SESSION_URL_TTL`.
 - **Storage and logs:** Statelock stores only the token's hash and redacts tokens from its logs.
-- **Errors:** a request Statelock refuses raises `SessionUrlError`, with the HTTP `status`.
-- **Headers instead:** agents that can send headers may connect to `ws://.../statelock` with `Authorization: Bearer <key>`; `connect_statelock(playwright, url, agent_id)` does this.
+- **Errors:** a request Statelock refuses raises `StatelockClientError`, with the HTTP `status`.
+- **Headers instead:** agents that can send headers may connect to `ws://.../statelock` with `Authorization: Bearer <key>` and the `x-statelock-agent-id` / `x-statelock-session-id` headers (`connect_over_cdp(url, headers=...)`).
 
 ### Saved sessions
 
@@ -434,19 +444,19 @@ await page.fill("#password", "{{secret:bank_password}}")   # the site receives t
 secrets:
   - name: bank_password
     agents: [finance_reconciliation_agent]       # who may use it
-    url_contains: https://bank.example.com/login # the origin, then part of the path
+    url_contains: https://bank.example.com/login # the origin, then this path or one below it
     value_env: BANK_PASSWORD                     # or value_file: /run/secrets/bank_password
     # password_fields_only: true                 # default: only into password fields
 ```
 
-- **Where it is typed.** Statelock replaces the placeholder in typed text (`Input.insertText`, which Playwright's `fill` sends) after the action passes its pre-conditions. It does so only for the listed agents, on a page whose URL has exactly the origin in `url_contains` (`http(s)://host[:port]`) and a path containing its path, and (by default) only into a password field. Anywhere else, the placeholder ends the session (`secret_injection`).
+- **Where it is typed.** Statelock replaces the placeholder in typed text (`Input.insertText`, which Playwright's `fill` sends, and `Input.imeSetComposition`) after the action passes its pre-conditions. It does so only for the listed agents, on a page whose URL has exactly the origin in `url_contains` (`http(s)://host[:port]`) and a path equal to its path or below it (`/login` covers `/login/2fa`, not `/forum/login` or `/loginfoo`), and (by default) only into a password field. Anywhere else, the placeholder ends the session (`secret_injection`).
 - **What the agent sees.** The placeholder. Statelock replaces the value with `[SECRET]` in every answer the browser sends the agent and in every `request_access` response. Reading the field back returns `[SECRET]`.
 - **Evidence.** The typed text is recorded as `[SECRET]`, with the secret's name (`statelock_secrets`). The value is removed from action records and the network log.
 - **Values.** They are read from the proxy's environment or files when it starts, and a missing value fails at startup. The agent's own environment never holds them.
 - **Limits.** Typing the placeholder key by key (`keyboard.type`) sends it literally. Page code the agent runs could read the field and transform the value before returning it; no filter can recognise that.
 - **With a saved session**, the login usually happens once: later sessions start logged in.
 
-Cookies are not exported either. Playwright's `page.request` / `context.request` (without `install()`), and cookies copied into another HTTP client, would act as the logged-in user outside Statelock. Reading cookies over CDP returns only what the agent's policies allow (`cookie_access`). With no `cookie_access`, the read is declined (`cookie_export`), so those calls fail instead of bypassing Statelock, and the session continues. Either way the read is recorded. For HTTP, use `request_access`: after `install()`, `page.request` goes through Statelock.
+Cookies are not exported either (see `cookie_access` in [Policies](#policies)).
 
 What no SDK can stop: plain HTTP from the agent's own process (for example `requests` with a password it holds). Use credential injection so the agent holds no password, and deploy the agent so it can reach only Statelock.
 
@@ -455,9 +465,9 @@ What no SDK can stop: plain HTTP from the agent's own process (for example `requ
 `statelock.client.install()` (async) or `statelock.client.install_sync()` (sync), once at startup, routes Playwright's own file APIs through Statelock:
 
 - **Uploads:** `set_input_files` (on a page, locator or element handle) and `FileChooser.set_files` upload the files through Statelock. The upload is governed, and the file's name, size and SHA-256 are recorded.
-- **Downloads:** `page.expect_download()` waits for the download Statelock checked. A download is checked when it begins (the page's policies, including `restrict_downloads`) and when it completes (size, SHA-256). Its value works like Playwright's Download (`save_as`, `path`, `suggested_filename`, `url`).
+- **Downloads:** `page.expect_download()` waits for the download Statelock checked. A download is checked when it begins (the page's policies, including `restrict_downloads`) and when it completes (size, SHA-256). Its value works like Playwright's Download (`save_as`, `path`, `suggested_filename`, `url`). Its default timeout is the page's `set_default_timeout`, as in Playwright.
 - **Other browsers are untouched:** each browser is asked once whether it is a Statelock session (`Statelock.session`).
-- **Without `install()`:** use `conn.set_input_files(page, target, files)` and `conn.expect_download(page)` from a `StatelockConnection`.
+- **Without `install()`:** the session object has the same two methods: `governed.set_input_files(target, files, page=None, timeout=None)` and `governed.expect_download(predicate=None, page=None, timeout=None)` (`page` defaults to `governed.page`); also `statelock.client.set_input_files(page, target, files)` and `statelock.client.expect_download(page, predicate=None, timeout=None)`. `timeout` is in milliseconds, as in Playwright: by default the page's or context's `set_default_timeout` (set after `install()`), else 30000; 0 waits without a limit. A blocked download raises `StatelockPolicyViolationError` with the rule Statelock reports; a guard adds the recorded violation. A `buffer` must be bytes-like or str; anything else raises `TypeError`. A path's MIME type comes from its extension (the same table as the JS SDK).
 
 Limits (see the [roadmap](https://github.com/inferlink/statelock/blob/main/ROADMAP.md)):
 
@@ -476,13 +486,13 @@ Limits (see the [roadmap](https://github.com/inferlink/statelock/blob/main/ROADM
 from browser_use import Agent
 from statelock.integrations.browser_use import create_browser_use_session
 
-governed = create_browser_use_session()   # STATELOCK_URL, STATELOCK_API_KEY
+governed = await create_browser_use_session()   # STATELOCK_URL, STATELOCK_API_KEY
 agent = Agent(task="...", browser_session=governed.browser, llm=...)
 await agent.run()
 governed.raise_if_violation()             # StatelockPolicyViolationError (rule, reason)
 ```
 
-browser-use reports a blocked action to its model as a failed step, not as an exception, so the run continues; Statelock has already ended the session, so nothing else gets through. `governed.violation()` / `raise_if_violation()` give the rule and reason afterwards. A lookup Statelock refuses (a wrong key) raises `SessionUrlError`, not "no violation". To build the browser-use object yourself, pass `create_session_url().cdp_url` to `BrowserSession(cdp_url=...)`. browser-use sends anonymous telemetry by default: set `ANONYMIZED_TELEMETRY=false` to turn it off.
+browser-use reports a blocked action to its model as a failed step, not as an exception, so the run continues; Statelock has already ended the session, so nothing else gets through. `governed.violation()` / `raise_if_violation()` give the rule and reason afterwards. A lookup Statelock refuses (a wrong key) raises `StatelockClientError`, not "no violation". To build the browser-use object yourself, pass `create_session_url().cdp_url` to `BrowserSession(cdp_url=...)`. browser-use sends anonymous telemetry by default: set `ANONYMIZED_TELEMETRY=false` to turn it off.
 
 **LangChain and CrewAI.** Give LangChain's Playwright toolkit a browser from a session URL, and wrap its tools with `governed_playwright_tools` (`pip install "statelock-ai[langchain]"`):
 
@@ -504,19 +514,19 @@ Every click and keystroke is governed without the wrapper. What the wrapper adds
 
 The wrapper returns copies; the tools passed in are not modified. `statelock_tools(tools, session)` wraps other LangChain tools that drive the governed browser. CrewAI's `StagehandTool` only runs on Browserbase's cloud browsers, so it cannot use a Statelock session; use the LangChain toolkit through CrewAI instead.
 
-**Stagehand.** `examples/ojs/` is a Stagehand agent on a mock journal: three Statelock lines in `main()`, and a password placeholder instead of the password (`pip install "statelock-ai[stagehand]"`).
+**Stagehand.** `examples/ojs/` is a Stagehand agent on a mock journal: three Statelock lines in `open_session()` and `run_governed()`, and a password placeholder instead of the password (`pip install "statelock-ai[stagehand]"`).
 
 **JavaScript and TypeScript.** `@statelock/client` (`js/`) is not yet on npm; build it from `js/` (`npm ci` runs the build). It has:
 
-- `createSessionUrl()`, `session.guard()` and `secret()`;
-- `install(browser)` for Playwright's file APIs;
+- `createSessionUrl()`, `session.guard()`, `session.violation()` and `secret()`;
+- `connectPlaywright()` (with `setInputFiles` / `expectDownload`) and `install(browser)` for Playwright's file APIs;
 - CDP helpers for other frameworks.
 
-`examples/ojs-ts/` is the OJS agent in TypeScript on Stagehand v3. Stagehand v4 is not supported: its driver runs as a browser extension, not over CDP.
+`examples/ojs-ts/` is the OJS agent in TypeScript on Stagehand v3. For other JavaScript frameworks, see the [JS SDK README](https://github.com/inferlink/statelock/blob/main/js/README.md#frameworks).
 
 ## Configuration
 
-All settings are `STATELOCK_*` environment variables (`statelock/settings.py`):
+All settings are `STATELOCK_*` environment variables (`statelock/settings.py`). With Docker, put them in `.env`: Compose passes it to the proxy container (`.env.example` lists the common ones). The compose files set the policy, artifact and keys paths, and `compose.dev.yaml` also sets the demo, debug, secrets, saved-session, extra policy and rule module settings; those values override `.env`.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -530,7 +540,7 @@ All settings are `STATELOCK_*` environment variables (`statelock/settings.py`):
 | `STATELOCK_LOG_LEVEL` | `INFO` | Level for Statelock's logging setup. Empty leaves logging to the host. |
 | `STATELOCK_AUTH_MODE` | `api_key` | `api_key` or `none` (development only). |
 | `STATELOCK_AUTH_KEYS_FILE` | none | Keys file (hashes). Required when `STATELOCK_AUTH_MODE=api_key`. |
-| `STATELOCK_SESSION_URL_TTL` | 300 | Seconds a session URL (`POST /sessions`, `statelock session-url`) stays usable. |
+| `STATELOCK_SESSION_URL_TTL` | 300 | Seconds a session URL (`POST /sessions`, `statelock session-url`) stays usable (at most 3600). |
 | `STATELOCK_SECRETS_FILE` | none | Secrets agents type as `{{secret:name}}` (credential injection). Values come from `value_env` or `value_file`; a missing one fails at startup. |
 | `STATELOCK_SAVED_SESSIONS_KEY_FILE` | none (saved sessions off) | AES-256-GCM key for saved browser sessions, outside the saved-session directory. Created if missing. |
 | `STATELOCK_SAVED_SESSIONS_DIR` | `STATELOCK_ARTIFACT_DIR/saved-sessions` | Where saved browser sessions are stored. |
@@ -545,21 +555,24 @@ All settings are `STATELOCK_*` environment variables (`statelock/settings.py`):
 | `STATELOCK_REVIEW_TIMEOUT` | 300 | Seconds a paused action waits for a reviewer before it is blocked. |
 | `STATELOCK_REVIEW_HISTORY_SIZE` | 1000 | Decided reviews kept in memory for the review API. |
 | `STATELOCK_VIOLATION_REGISTRY_SIZE` | 1000 | Violations kept in memory for `GET /violations/<session_id>`. |
+| `STATELOCK_MAX_CONCURRENT_REQUESTS` | 4 | `Statelock.fetch` requests (`request_access`) running at once in one session. Another one is declined (`request_concurrency`) and recorded; the session continues. |
 | `STATELOCK_REPLAY_SCRIPT_CLICKS` | `true` | Replay a plain `element.click()` from agent code as a governed real click. `false`: such clicks are violations. |
 | `STATELOCK_AGENT_SCRIPT_GRACE` | 0.5 | Seconds after agent code returns that a click it started still counts as the agent's (and is replayed). |
 | `STATELOCK_REPLAY_WAIT` | 10 | Seconds the agent's next command waits, at most, for a replayed click to finish. |
-| `STATELOCK_CHROMIUM_HOST` | `127.0.0.1` | Address Chromium's remote debugging port listens on. |
 | `STATELOCK_CHROMIUM_SANDBOX` | `false` (`1` in `compose.yaml`) | Chromium sandbox. It needs a non-root user and a seccomp profile that allows user namespaces; `compose.yaml` provides both (see [docker/README-sandbox.md](https://github.com/inferlink/statelock/blob/main/docker/README-sandbox.md)). If the sandbox cannot start, sessions are refused. |
+| `STATELOCK_CHROMIUM_START_TIMEOUT` | 10 | Seconds Chromium has to start and answer on its CDP pipe; otherwise the session is refused. |
 | `STATELOCK_CAPTURE_TIMEOUT` | 2.5 | Seconds a state capture may take before the action is blocked. |
 | `STATELOCK_POST_CAPTURE_SETTLE` | 0.2 | Seconds to wait after a commit action before capturing the page for post-conditions. |
 | `STATELOCK_HELD_RESPONSE_TIMEOUT` | 10 | Seconds to wait for the browser's response to a held commit action. |
 | `STATELOCK_VIOLATION_CLOSE_DELAY` | 0.5 | Seconds between the in-band violation error and closing the session. |
 | `STATELOCK_GUARD_READY_TIMEOUT` | 10 | Seconds an agent command on a new page or iframe waits for Statelock's setup there (the page guard). |
-| `STATELOCK_GUARD_COMMAND_TIMEOUT` | 5 | Seconds Statelock's own CDP commands to the browser may take. |
+| `STATELOCK_CDP_COMMAND_TIMEOUT` | 5 | Seconds Statelock's own CDP commands to the browser may take. |
 | `STATELOCK_ATTRIBUTION_TIMEOUT` | 1 | Seconds to wait for a request's initiator before it is logged as `unknown`. |
 | `STATELOCK_TRUSTED_SUBMIT_WINDOW` | 3 | Seconds after a submit from real input during which the form's navigation counts as trusted. |
 | `STATELOCK_AGENT_NAVIGATION_WINDOW` | 10 | Seconds after an agent navigation command during which a page load is attributed to it. |
 | `STATELOCK_MEMORY_SETTLE` | 0.5 | Seconds after a page load before the second capture of remembered fields. |
+
+Every number must be positive, except `STATELOCK_PERCEPTION_RETRIES`, `STATELOCK_POST_CAPTURE_SETTLE`, `STATELOCK_VIOLATION_CLOSE_DELAY`, `STATELOCK_AGENT_SCRIPT_GRACE` and `STATELOCK_MEMORY_SETTLE`, which may be 0. An invalid value fails at startup.
 
 ## Extending
 
@@ -584,34 +597,47 @@ Statelock Enclave is InferLink's commercial add-on for production and audit, bui
 
 ```text
 src/statelock/
-  core/        shared types: actions, state, verdicts, enums
-  policy/      policy schema, fields and remembered values, rule registry, evaluator, perception (VLM)
+  core/        shared types: actions, state, verdicts, enums; URL scopes and request URLs (urls.py); CDP JSON helpers
+  policy/      policy schema, fields and remembered values, rule registry, triggers, evaluator,
+               request_access, cookie_access, regex checks (patterns.py), text normalization (text.py),
+               currencies (currency.py), custom rule loading (extensions.py), perception (VLM)
   audit/       record schema, redaction, sequenced writer, ArtifactSink, LocalJsonSink
-  proxy/       bridge (session), governor, memory watcher, reporter, targets, inspector,
-               guard, attribution, commands, uploads, downloads, files, tasks, connection, pages, worlds, js/
-  client/      SDK: session URLs, connect_playwright / connect_playwright_sync, install() / install_sync() for
-               Playwright's file APIs (async files.py + install.py, sync.py, shared protocol in transfer.py),
-               connection, violations
+  proxy/       bridge (session), browser (Chromium over a CDP pipe), connection, governor, replay (script clicks),
+               memory watcher, reporter, targets, inspector, guard, attribution, scripts, commands, cookies,
+               network_filter, requests, uploads, downloads, download_policy, files, tasks, pages, worlds,
+               js/ (guard.js, page_state.js, describe_element.js, focused_element.js, replay_point.js,
+               replay_hits.js, fetch.js)
+  client/      SDK: session URLs, connect_playwright / connect_playwright_sync (playwright.py), install() / install_sync() for
+               Playwright's file APIs (async files.py + install.py, sync files_sync.py + install_sync.py,
+               protocol in transfer.py, patching.py), connection (header path, internal),
+               requests (statelock_fetch), violations
   integrations/  langchain.py (LangChain / CrewAI browser tools), browser_use.py (browser-use)
   review/      human review: queue of paused actions, review API, /review page
   demo/        /demo/finance, /demo/bank, /demo/erp (STATELOCK_DEMO=1 only)
-  app.py       create_app() factory, get_services(), authenticated_identity, authenticated_reviewer
+  app.py       create_app() factory and routes; re-exports get_services() and the authenticated_* dependencies
+  dependencies.py          FastAPI dependencies: authenticated_identity, authenticated_auditor
   sessions.py, tokens.py   session URLs (POST /sessions, single-use tokens), /saved-sessions
   saved_sessions.py        encrypted saved browser sessions (AES-GCM store, restore, save)
   credentials.py           credential injection: secrets file, {{secret:name}} placeholders, scrubbing
   auth.py      agent, reviewer and auditor API keys
   __main__.py  the statelock command: the proxy (no subcommand), keygen, hash-key, session-url,
                saved-sessions, check-sandbox, perception-check
-  settings.py, plugins.py, events.py, services.py, registry.py, wire.py
-tests/         unit tests; browser tests (test_browser_*.py, skipped without Chromium)
+  settings.py, plugins.py, events.py, services.py, registry.py, wire.py, fileio.py
+tests/         unit tests; browser tests (test_browser_*.py, skipped without Chromium unless STATELOCK_REQUIRE_BROWSER=1);
+               helpers (conftest.py, helpers.py, fakes.py, browser_support.py, ojs_support.py); fixtures/perception
 examples/      rogue_agent.py, finance_agent.py, portal_agent.py; ojs/ (Stagehand OJS agent, mock OJS site, its policy and custom rule);
                ojs-ts/ (the OJS agent in TypeScript on Stagehand v3)
-js/            @statelock/client: the JavaScript/TypeScript SDK (session URLs, guard, Playwright install())
+js/            @statelock/client: the JavaScript/TypeScript SDK; src/ index.ts, sessions.ts, violations.ts, cdp.ts,
+               http.ts, mime.ts, playwright.ts (@statelock/client/playwright); test/
 policies/      default.yaml
-docker/        Dockerfile (targets: runtime, dev, ojs), seccomp profile, dev keys, dev secrets
+docker/        Dockerfile (targets: runtime, dev, ojs), seccomp profile, dev keys, dev secrets, README-sandbox.md
+compose.yaml   the proxy; compose.dev.yaml adds demos, demo agents, tests and the vlm profile
+.github/workflows/  ci.yml (lint, types, tests, extras, JS), dco.yml (sign-off check), release.yml (PyPI and GitHub release)
 ```
 
 ## Development
+
+Compose commands that use `compose.yaml` need `.env`, because it reads it (`env_file: .env`): run `cp .env.example .env` first.
 
 The Docker Quick start uses `compose.dev.yaml`, which mounts public development keys and enables demo pages. To run `compose.yaml` alone, first install the `statelock-ai` CLI, configure a policy for your agent, and create its keys file:
 
@@ -626,7 +652,19 @@ To run the test suite in Docker, use the development override:
 docker compose -f compose.yaml -f compose.dev.yaml --profile test run --rm statelock-tests
 ```
 
-Other demo services and profiles are listed in [compose.dev.yaml](compose.dev.yaml); the [OJS walkthrough](examples/ojs/README.md) covers the journal agent.
+To drop the `-f` flags, set `COMPOSE_FILE=compose.yaml:compose.dev.yaml` in `.env`.
+
+To try `visual_assert` with a local vision model (profile `vlm`; it needs only `compose.dev.yaml`):
+
+```bash
+docker compose -f compose.dev.yaml --profile vlm up -d ollama
+docker compose -f compose.dev.yaml --profile vlm run --rm ollama-pull        # download the model, once
+docker compose -f compose.dev.yaml --profile vlm run --rm perception-tests
+```
+
+`perception-tests` runs `tests/test_perception_model.py` against `DEMO_VLM_MODEL` (default `qwen2.5vl:3b`, about 4 GB of memory). It prints the model's answers and checks only their form; set `DEMO_VLM_CHECK_ANSWERS=true` in `.env` to also require correct answers.
+
+Other demo services and profiles are listed in [compose.dev.yaml](https://github.com/inferlink/statelock/blob/main/compose.dev.yaml); the [OJS walkthrough](https://github.com/inferlink/statelock/blob/main/examples/ojs/README.md) covers the journal agent.
 
 For a local development install:
 
@@ -639,8 +677,10 @@ ruff check src tests examples && ruff format --check src tests examples && pytho
 - Python 3.10+ (the `browser-use` extra needs 3.11+). The Docker images use Python 3.12 (Playwright's Ubuntu 24.04 "noble" image). `mypy` is strict for `core` and `policy`.
 - The Docker image pins Playwright 1.56.0 (Chromium 141) and runs as `pwuser`. On Linux hosts, `./artifacts` must be writable by that user.
 - Injected JavaScript lives in `src/statelock/proxy/js/`.
-- Contributions: see [CONTRIBUTING.md](https://github.com/inferlink/statelock/blob/main/CONTRIBUTING.md). Every commit needs a DCO sign-off (`git commit -s`).
+- CI (`.github/workflows/ci.yml`) also runs the browser tests with `STATELOCK_REQUIRE_BROWSER=1`, so they fail instead of skipping without Chromium, plus the extras' tests and the JavaScript SDK.
+- Contributions: see [CONTRIBUTING.md](https://github.com/inferlink/statelock/blob/main/CONTRIBUTING.md). Every commit needs a DCO sign-off (`git commit -s`); a check on pull requests enforces it.
 - Security issues: see [SECURITY.md](https://github.com/inferlink/statelock/blob/main/SECURITY.md).
+- Releases: the manual Release workflow publishes `statelock-ai` to PyPI and creates the GitHub release (see [CONTRIBUTING.md](https://github.com/inferlink/statelock/blob/main/CONTRIBUTING.md#releases)).
 
 ## Roadmap
 

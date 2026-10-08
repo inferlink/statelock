@@ -17,7 +17,7 @@ Please do not open a public issue. Report it privately, in either of these ways:
 ## What to expect
 
 - We acknowledge your report, and keep you informed while we investigate and fix it.
-- We agree with you when the issue is disclosed, after a fixed release is available.
+- We agree a disclosure date with you, after a fixed release is available.
 - We credit you in the release notes unless you prefer not to be named.
 
 ## Supported versions

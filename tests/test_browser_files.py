@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,8 @@ from browser_support import (
     upload_session,
     wait_for_proxy_close,
 )
+
+from statelock.client import StatelockDownloadError
 
 pytestmark = pytest.mark.browser
 
@@ -63,7 +66,7 @@ def test_sdk_set_input_files_is_governed_and_submits(server: dict[str, Any], tmp
     report.write_bytes(b"x" * (5 * 1024 * 1024 + 7))  # more than one upload chunk
 
     async def steps(conn: Any, page: Any) -> Any:
-        stored = await conn.set_input_files(page, "#file", [report, {"name": "b.csv", "buffer": b"a,b"}])
+        stored = await conn.set_input_files("#file", [report, {"name": "b.csv", "buffer": b"a,b"}], page=page)
         await page.wait_for_function("document.getElementById('picked').textContent === 'picked:2'")
         await page.click("#upgo")
         await page.wait_for_url("**/gov/result")
@@ -106,7 +109,7 @@ def test_set_file_input_files_with_other_host_paths_is_refused(server: dict[str,
 
 def test_download_is_checked_recorded_and_fetched(server: dict[str, Any], tmp_path: Path) -> None:
     async def steps(conn: Any, page: Any) -> Any:
-        async with conn.expect_download(page) as info:
+        async with conn.expect_download(page=page) as info:
             await page.click("#pdf")
         download = await info.value
         saved = await download.save_as(tmp_path / "report.pdf")
@@ -125,9 +128,29 @@ def test_download_is_checked_recorded_and_fetched(server: dict[str, Any], tmp_pa
     assert "/gov/docs" in records[0]["context"]["browser_state"]["url"]
 
 
+def test_connection_expect_download_takes_milliseconds_and_a_predicate(server: dict[str, Any]) -> None:
+    """Like Playwright's expect_download: ``timeout`` in ms, ``predicate`` picks the download."""
+
+    async def steps(conn: Any, page: Any) -> Any:
+        async with conn.expect_download(lambda d: d.name == "report.pdf", timeout=10_000) as info:
+            await page.click("#pdf")
+        accepted = (await info.value).name
+        started = time.monotonic()
+        with pytest.raises(StatelockDownloadError, match="no download completed"):
+            async with conn.expect_download(lambda _: False, timeout=1500):
+                await page.click("#pdf")
+        return accepted, time.monotonic() - started
+
+    _, result = asyncio.run(download_session(server, steps))
+    assert not isinstance(result, Exception), result
+    accepted, waited = result
+    assert accepted == "report.pdf"
+    assert 1.4 < waited < 10  # 1500 ms, not 1500 s
+
+
 def test_download_with_a_disallowed_type_is_blocked(server: dict[str, Any]) -> None:
     async def steps(conn: Any, page: Any) -> Any:
-        async with conn.expect_download(page) as info:
+        async with conn.expect_download(page=page) as info:
             await page.click("#exe")
         return await info.value
 
@@ -139,7 +162,7 @@ def test_download_with_a_disallowed_type_is_blocked(server: dict[str, Any]) -> N
 
 def test_download_over_the_size_limit_is_blocked(server: dict[str, Any]) -> None:
     async def steps(conn: Any, page: Any) -> Any:
-        async with conn.expect_download(page) as info:
+        async with conn.expect_download(page=page) as info:
             await page.click("#big")
         return await info.value
 
@@ -155,7 +178,7 @@ def test_agent_cannot_redirect_downloads(server: dict[str, Any], tmp_path: Path)
     async def steps(conn: Any, page: Any) -> Any:
         cdp = await conn.browser.new_browser_cdp_session()
         await cdp.send("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": str(elsewhere)})
-        async with conn.expect_download(page) as info:
+        async with conn.expect_download(page=page) as info:
             await page.click("#pdf")
         return await info.value
 
@@ -169,7 +192,7 @@ def test_download_in_a_new_browser_context_is_governed(server: dict[str, Any]) -
         context = await conn.browser.new_context()
         other = await context.new_page()
         await other.goto(server["base"] + "/gov/docs")
-        async with conn.expect_download(other) as info:
+        async with conn.expect_download(page=other) as info:
             await other.click("#pdf")
         download = await info.value
         return await download.read_bytes()

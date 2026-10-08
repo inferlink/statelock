@@ -178,7 +178,7 @@ def test_install_retries_without_run_immediately() -> None:
 def test_request_from_tagged_code_is_agent_code() -> None:
     guard, _ = _guard()
     state = _state()
-    guard.handle_request_will_be_sent(
+    guard._handle_request_will_be_sent(
         state,
         {"requestId": "R1", "initiator": {"type": "script", "stack": {"callFrames": [{"url": AGENT_SOURCE_URL}]}}},
     )
@@ -188,10 +188,10 @@ def test_request_from_tagged_code_is_agent_code() -> None:
 def test_script_created_by_agent_code_taints_requests() -> None:
     guard, _ = _guard()
     state = _state()
-    guard.handle_script_parsed(
+    guard._handle_script_parsed(
         state, {"scriptId": "42", "url": "", "stackTrace": {"callFrames": [{"url": AGENT_SOURCE_URL}]}}
     )
-    guard.handle_request_will_be_sent(
+    guard._handle_request_will_be_sent(
         state, {"requestId": "R2", "initiator": {"type": "script", "stack": {"callFrames": [{"scriptId": "42"}]}}}
     )
     assert state.attributions["R2"]["initiated_by"] == InitiatedBy.AGENT_CODE.value
@@ -201,22 +201,22 @@ def test_site_request_is_site_and_redirect_keeps_attribution() -> None:
     guard, _ = _guard()
     state = _state()
     site = {"type": "script", "stack": {"callFrames": [{"url": "https://portal.test/app.js"}]}}
-    guard.handle_request_will_be_sent(state, {"requestId": "R3", "initiator": site})
+    guard._handle_request_will_be_sent(state, {"requestId": "R3", "initiator": site})
     assert state.attributions["R3"]["initiated_by"] == InitiatedBy.SITE.value
     state.attributions["R4"] = {"initiated_by": InitiatedBy.AGENT_CODE.value}
-    guard.handle_request_will_be_sent(state, {"requestId": "R4", "initiator": {"type": "other"}})
+    guard._handle_request_will_be_sent(state, {"requestId": "R4", "initiator": {"type": "other"}})
     assert state.attributions["R4"]["initiated_by"] == InitiatedBy.AGENT_CODE.value
 
 
 def test_form_submission_without_trusted_submit_is_flagged() -> None:
     guard, _ = _guard(["/gov/"])
     state = _state()
-    guard.handle_requested_navigation(state, {"reason": "formSubmissionPost", "url": "https://portal.test/gov/result"})
+    guard._handle_requested_navigation(state, {"reason": "formSubmissionPost", "url": "https://portal.test/gov/result"})
     assert state.untrusted_form_urls == {"https://portal.test/gov/result"}
 
     trusted = _state()
-    guard.handle_binding(trusted, '{"kind": "trusted_submit"}')
-    guard.handle_requested_navigation(
+    guard._handle_binding(trusted, '{"kind": "trusted_submit"}')
+    guard._handle_requested_navigation(
         trusted, {"reason": "formSubmissionPost", "url": "https://portal.test/gov/result"}
     )
     assert trusted.untrusted_form_urls == set()
@@ -226,10 +226,10 @@ def test_xhr_to_the_submitted_url_keeps_the_form_mark() -> None:
     guard, _ = _guard(["/gov/"])
     state = _state()
     url = "https://portal.test/gov/result"
-    guard.handle_requested_navigation(state, {"reason": "formSubmissionPost", "url": url})
-    assert guard.classify(state, url, "XHR", {"initiated_by": "site"})[1] is None
+    guard._handle_requested_navigation(state, {"reason": "formSubmissionPost", "url": url})
+    assert guard._classify(state, url, "XHR", {"initiated_by": "site"})[1] is None
     assert url in state.untrusted_form_urls
-    assert guard.classify(state, url, "Document", {"initiated_by": "site"})[1] == "untrusted_form_submission"
+    assert guard._classify(state, url, "Document", {"initiated_by": "site"})[1] == "untrusted_form_submission"
     assert state.untrusted_form_urls == set()
 
 
@@ -237,9 +237,9 @@ def test_agent_navigation_consumed_once() -> None:
     guard, _ = _guard()
     state = _state()
     guard._states["G1"] = state
-    guard.note_agent_navigation("T1", "https://portal.test/gov/step3")
-    assert guard.consume_agent_navigation(state, "https://portal.test/gov/step3")
-    assert not guard.consume_agent_navigation(state, "https://portal.test/gov/step3")
+    guard._note_agent_navigation("T1", "https://portal.test/gov/step3")
+    assert guard._consume_agent_navigation(state, "https://portal.test/gov/step3")
+    assert not guard._consume_agent_navigation(state, "https://portal.test/gov/step3")
 
 
 def test_synthetic_binding_reports_violation() -> None:
@@ -247,7 +247,7 @@ def test_synthetic_binding_reports_violation() -> None:
 
     async def scenario():
         guard, _ = _guard(violations=violations)
-        guard.handle_binding(_state(), '{"kind": "synthetic_event", "event_type": "click"}')
+        guard._handle_binding(_state(), '{"kind": "synthetic_event", "event_type": "click"}')
         await asyncio.sleep(0)
         await guard.close()
 
@@ -289,7 +289,7 @@ def test_agent_script_click_is_located_and_scrolled_only_for_the_replay() -> Non
     async def scenario():
         guard, connection, replays, violations = _replay_guard(results)
         state = TargetGuardState(target_id="T1", session_id="G1")
-        guard.handle_binding(state, '{"kind": "synthetic_event", "event_type": "click", "replay_id": 3}', 11)
+        guard._handle_binding(state, '{"kind": "synthetic_event", "event_type": "click", "replay_id": 3}', 11)
         await guard.close()
         return connection, replays, violations
 
@@ -313,7 +313,7 @@ def test_agent_script_click_is_located_and_scrolled_only_for_the_replay() -> Non
 def test_script_click_not_replayed_without_agent_code_or_element() -> None:
     async def scenario(active, payload):
         guard, connection, replays, violations = _replay_guard({}, active=active)
-        guard.handle_binding(TargetGuardState(target_id="T1", session_id="G1"), payload, 11)
+        guard._handle_binding(TargetGuardState(target_id="T1", session_id="G1"), payload, 11)
         await guard.close()
         return connection, replays, violations
 
@@ -334,8 +334,8 @@ def test_file_input_binding_keeps_its_kind_and_explains() -> None:
 
     async def scenario():
         guard, _ = _guard(violations=violations)
-        guard.handle_binding(_state(), '{"kind": "untrusted_file_input", "files": ["a.pdf"], "url": "u"}')
-        guard.handle_binding(_state(), '{"kind": "made_up"}')
+        guard._handle_binding(_state(), '{"kind": "untrusted_file_input", "files": ["a.pdf"], "url": "u"}')
+        guard._handle_binding(_state(), '{"kind": "made_up"}')
         await asyncio.sleep(0)
         await guard.close()
 
@@ -379,7 +379,7 @@ def _decide(attribution, url="https://portal.test/gov/api/delete", resource_type
 
     async def scenario():
         guard._states["G1"] = state
-        await guard.decide(
+        await guard._decide(
             "G1",
             state,
             {
@@ -416,3 +416,90 @@ def test_decide_unknown_attribution_is_allowed_and_logged() -> None:
     guard_timeout_methods, _, records = _decide(None)
     assert guard_timeout_methods == ["Fetch.continueRequest"]
     assert records[0]["initiated_by"] == InitiatedBy.UNKNOWN.value
+
+
+def test_install_once_keeps_what_the_guard_learned() -> None:
+    # Re-attaching to a tab must not forget which scripts agent code created.
+    async def scenario():
+        guard, connection = _guard(["/gov/"])
+        await guard.install("T1")
+        state = guard._states["G1"]
+        state.tainted_script_ids.add("42")
+        sent = len(connection.sent)
+        await guard.install("T1")
+        await guard.close()
+        return guard._states["G1"], len(connection.sent) - sent
+
+    state, resent = run(scenario())
+    assert state.tainted_script_ids == {"42"} and state.installed
+    assert resent == 0
+
+
+def _history_guard(history):
+    connection = FakeConnection(results={"Page.getNavigationHistory": history})
+    guard, _ = _guard(["/gov/"], connection=connection)
+    state = _state()
+    state.session_id = "G1"
+    guard._states["G1"] = state
+    return guard, state
+
+
+HISTORY = {
+    "currentIndex": 1,
+    "entries": [
+        {"id": 7, "url": "https://portal.test/gov/form"},
+        {"id": 8, "url": "https://portal.test/gov/result#done"},
+    ],
+}
+
+
+def test_reload_and_history_navigation_label_only_their_own_page_load() -> None:
+    async def scenario():
+        guard, state = _history_guard(HISTORY)
+        guard.note_command({"method": "Page.reload", "params": {}}, "T1")
+        guard.note_command({"method": "Page.navigateToHistoryEntry", "params": {"entryId": 7}}, "T1")
+        await guard._navigation_lookups(state)
+        urls = [navigation.url for navigation in state.agent_navigations]
+        # Another page load (a site redirect elsewhere) is not the agent's navigation.
+        other = guard._consume_agent_navigation(state, "https://portal.test/gov/other")
+        reload = guard._consume_agent_navigation(state, "https://portal.test/gov/result")
+        back = guard._consume_agent_navigation(state, "https://portal.test/gov/form")
+        await guard.close()
+        return urls, other, reload, back
+
+    urls, other, reload, back = run(scenario())
+    assert urls == ["https://portal.test/gov/result", "https://portal.test/gov/form"]
+    assert (other, reload, back) == (False, True, True)
+
+
+def test_navigation_without_a_known_url_labels_a_page_load_briefly() -> None:
+    async def scenario():
+        guard, state = _history_guard({"currentIndex": 0, "entries": []})
+        guard.timings.unknown_navigation_window = 0.05
+        guard.note_command({"method": "Page.reload", "params": {}}, "T1")
+        await guard._navigation_lookups(state)
+        await asyncio.sleep(0.1)
+        late = guard._consume_agent_navigation(state, "https://portal.test/gov/other")
+        guard.note_command({"method": "Page.reload", "params": {}}, "T1")
+        await guard._navigation_lookups(state)
+        soon = guard._consume_agent_navigation(state, "https://portal.test/gov/other")
+        await guard.close()
+        return late, soon
+
+    assert run(scenario()) == (False, True)
+
+
+def test_out_of_process_frame_of_a_governed_page_is_governed() -> None:
+    guard, _ = _guard(["/gov/"])
+    page = TargetGuardState(target_id="T1", session_id="G1", main_frame_url="https://portal.test/gov/form")
+    frame = TargetGuardState(
+        target_id="F2", session_id="G2", main_frame_url="https://ads.test/widget", parent_frame_id="T1"
+    )
+    guard._states.update({"G1": page, "G2": frame})
+    agent = {"initiated_by": "agent_code"}
+    assert guard._classify(frame, "https://ads.test/api", "XHR", agent)[1] == SystemRule.AGENT_CODE_REQUEST.value
+    page.main_frame_url = "https://open.test/"
+    assert guard._classify(frame, "https://ads.test/api", "XHR", agent)[1] is None
+    # A frame whose page Statelock does not know is governed (fail closed).
+    frame.parent_frame_id = "UNKNOWN"
+    assert guard._classify(frame, "https://ads.test/api", "XHR", agent)[1] == SystemRule.AGENT_CODE_REQUEST.value

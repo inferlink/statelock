@@ -111,8 +111,9 @@ policies:
         ojs_decision: {paper_field: url_paper_id}
       # Before "Record Editorial Decision": the decline form is open, the email is long
       # enough and is the one the decision source has for this paper. The agent types a
-      # "Regarding submission N:" line (about 26 characters) before its email of at least
-      # 20 (MIN_EMAIL_CHARS), so the editor must hold at least 50.
+      # "Regarding submission N:" line (about 26 characters) before the decided email, which
+      # has at least 20 characters (MIN_EMAIL_CHARS in ojs_rules.py), so the editor must hold
+      # at least 50.
       - trigger: {click_text: [Record Editorial Decision]}
         assert_compare: {left: record_buttons, op: ">=", value: 1}
       - trigger: {click_text: [Record Editorial Decision]}

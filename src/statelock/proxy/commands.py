@@ -67,6 +67,14 @@ def _network_configuration_refusal(method: Any, params: dict[str, Any]) -> tuple
         return SystemRule.AGENT_NETWORK_INTERCEPTION.value, "Blocked agent-selected browser proxy."
     if method == "Security.setIgnoreCertificateErrors" and params.get("ignore") is True:
         return SystemRule.AGENT_NETWORK_INTERCEPTION.value, "Blocked ignoring certificate errors."
+    if (method == "Security.setOverrideCertificateErrors" and params.get("override") is True) or (
+        method == "Security.handleCertificateError"
+    ):
+        # The agent would decide which invalid certificates the browser accepts.
+        return (
+            SystemRule.AGENT_NETWORK_INTERCEPTION.value,
+            f"Blocked {method}: certificate errors cannot be overridden.",
+        )
     return None
 
 

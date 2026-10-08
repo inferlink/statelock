@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -64,8 +65,8 @@ def test_session_url_opens_a_governed_session(server: dict[str, Any]) -> None:
     assert records and records[0]["context"]["agent_id"] == AGENT
     assert records[0]["context"]["tenant_id"] == "test"
 
-    # Single use: the same URL does not open a second session.
-    with pytest.raises(Exception, match=r"404|refused|closed|4401"):
+    # Single use: the same URL does not open a second session (the token is gone: 404).
+    with pytest.raises(playwright_api.Error, match="Unexpected status 404"):
         asyncio.run(_with_page(url.cdp_url, steps))
 
 
@@ -208,22 +209,19 @@ def test_sync_playwright_uploads_and_downloads_work_after_install(server: dict[s
 def test_blocked_download_raises_through_playwrights_api(server: dict[str, Any], installed: None) -> None:
     url = _session_url(server)
 
-    async def steps(page: Any) -> Any:
+    async def steps(page: Any) -> StatelockPolicyViolationError:
         await page.goto(server["base"] + "/gov/docs")
-        try:
-            async with page.expect_download() as info:
+        with pytest.raises(StatelockPolicyViolationError) as raised:
+            async with url.guard(), page.expect_download():
                 await page.click("#exe")  # flow_agent allows .pdf and .bin only
-            return await info.value
-        except StatelockPolicyViolationError as violation:
-            return violation
-        except Exception as error:
-            return error
+        return raised.value
 
-    result = asyncio.run(_with_page(url.cdp_url, steps))
-    assert isinstance(result, (StatelockPolicyViolationError, playwright_api.Error)), result
+    violation = asyncio.run(_with_page(url.cdp_url, steps))
+    assert violation.rule == "restrict_downloads"
+    assert violation.recorded and violation.session_id == url.session_id  # the guard added the record
 
 
-def test_install_leaves_plain_browsers_alone(installed: None, tmp_path: Path) -> None:
+def test_install_leaves_plain_browsers_alone(installed: None) -> None:
     if not chromium_available():
         pytest.skip("Playwright Chromium is not installed")
 
@@ -280,3 +278,66 @@ def test_sync_install_leaves_plain_browsers_alone() -> None:
                 browser.close()
     finally:
         statelock.client.uninstall_sync()
+
+
+def test_session_objects_upload_and_download_without_install(server: dict[str, Any], tmp_path: Path) -> None:
+    """PlaywrightSession (the session URL path) has the file methods; no install() needed."""
+
+    async def steps() -> tuple[list[dict[str, Any]], str, bytes]:
+        async with playwright_api.async_playwright() as p:
+            key = agent_key(AGENT)
+            governed = await statelock.client.connect_playwright(p, server["base"], api_key=key)
+            async with governed, governed.guard():
+                page = governed.page
+                await page.goto(server["base"] + "/gov/upload")
+                stored = await governed.set_input_files("#file", {"name": "a.pdf", "buffer": b"%PDF-1"})
+                picked = await page.inner_text("#picked")
+                other = await page.context.new_page()
+                await other.goto(server["base"] + "/gov/docs")
+                async with governed.expect_download(lambda d: d.name == "report.pdf", page=other) as info:
+                    await other.click("#pdf")
+                download = await info.value
+                return stored, picked, (await download.save_as(tmp_path / "r.pdf")).read_bytes()
+
+    stored, picked, data = asyncio.run(steps())
+    assert ([f["name"] for f in stored], picked, data) == (["a.pdf"], "picked:1", FILES["report.pdf"])
+
+
+def test_sync_session_objects_upload_and_download_without_install(server: dict[str, Any], tmp_path: Path) -> None:
+    (tmp_path / "b.txt").write_text("b", encoding="utf-8")
+    with (
+        playwright_sync_api.sync_playwright() as p,
+        statelock.client.connect_playwright_sync(p, server["base"], api_key=agent_key(AGENT)) as governed,
+        governed.guard(),
+    ):
+        page = governed.page
+        page.goto(server["base"] + "/gov/upload")
+        stored = governed.set_input_files(page.locator("#file"), [tmp_path / "b.txt"], timeout=5000)
+        assert (stored[0]["mimeType"], page.inner_text("#picked")) == ("text/plain", "picked:1")
+        page.goto(server["base"] + "/gov/docs")
+        with governed.expect_download(timeout=10_000) as info:
+            page.click("#pdf")
+        assert info.value.read_bytes() == FILES["report.pdf"]
+
+
+def test_expect_download_honours_the_default_timeout(server: dict[str, Any]) -> None:
+    """Like Playwright's: no timeout given means the page's (or its context's) default timeout."""
+    statelock.client.install_sync()
+    try:
+        with (
+            playwright_sync_api.sync_playwright() as p,
+            statelock.client.connect_playwright_sync(p, server["base"], api_key=agent_key(AGENT)) as governed,
+        ):
+            page = governed.page
+            page.goto(server["base"] + "/gov/docs")
+            page.context.set_default_timeout(1500)
+            started = time.monotonic()
+            with (
+                pytest.raises(statelock.client.StatelockDownloadError, match="no download completed"),
+                page.expect_download(predicate=lambda _: False),
+            ):
+                page.click("#pdf")
+            waited = time.monotonic() - started
+    finally:
+        statelock.client.uninstall_sync()
+    assert 1.4 < waited < 15  # the context's 1.5 s, not the 30 s default

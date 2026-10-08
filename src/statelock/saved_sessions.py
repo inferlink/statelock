@@ -33,12 +33,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlsplit
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from statelock.core.jsonutil import as_dict
+from statelock.core.urls import origin_and_path
 from statelock.fileio import write_atomic
 from statelock.proxy.connection import CdpConnection, CdpError
 from statelock.proxy.pages import PageSessions
@@ -227,10 +227,11 @@ def _origin_entry(item: Any) -> tuple[str | None, dict[str, str]]:
 
 
 def _origin_of(url: str) -> str | None:
-    parts = urlsplit(url)
-    if parts.scheme not in {"http", "https"} or not parts.netloc:
+    """The http(s) origin of a page URL (no user info, no default port); None for other pages."""
+    parsed = origin_and_path(url)
+    if parsed is None or not parsed[0].startswith(("http://", "https://")):
         return None
-    return f"{parts.scheme}://{parts.netloc}"
+    return parsed[0]
 
 
 async def _read_local_storage(connection: CdpConnection, pages: PageSessions) -> list[dict[str, Any]]:

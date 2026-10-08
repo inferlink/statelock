@@ -91,20 +91,44 @@ class PolicyBundle(BaseModel):
         seen: dict[tuple[str, str], FieldSpec] = {}
         for policy in self.policies:
             for spec in policy.fields:
-                scope = spec.url_contains or policy.target_url_contains or ""
-                parsed = origin_and_path(scope)
-                if (
-                    spec.remember
-                    and not spec.allowed_origins
-                    and (parsed is None or not parsed[0].startswith(("http://", "https://")))
-                ):
-                    raise ValueError(
-                        f"agent {policy.agent_id}: remembered field {spec.name} needs an absolute URL scope "
-                        "or allowed_origins"
-                    )
                 key = (policy.agent_id, spec.name)
                 previous = seen.get(key)
                 if previous is not None and previous != spec:
                     raise ValueError(f"agent {policy.agent_id}: field {spec.name} is defined twice differently")
                 seen[key] = spec
+        return self
+
+    @model_validator(mode="after")
+    def _remembered_fields_pinned(self) -> PolicyBundle:
+        """A remembered value is carried to other pages, so it must come from a known site:
+        an absolute URL scope or allowed_origins."""
+        for policy in self.policies:
+            for spec in policy.fields:
+                if not spec.remember or spec.allowed_origins:
+                    continue
+                parsed = origin_and_path(spec.url_contains or policy.target_url_contains or "")
+                if parsed is None or not parsed[0].startswith(("http://", "https://")):
+                    raise ValueError(
+                        f"agent {policy.agent_id}: remembered field {spec.name} needs an absolute URL scope "
+                        "or allowed_origins"
+                    )
+        return self
+
+    @model_validator(mode="after")
+    def _remembered_references(self) -> PolicyBundle:
+        """Every ``remembered.<name>`` a rule reads is a ``remember: true`` field of the agent,
+        so a typo is refused here rather than blocking every action at runtime."""
+        remembered: dict[str, set[str]] = {}
+        for policy in self.policies:
+            names = remembered.setdefault(policy.agent_id, set())
+            names.update(spec.name for spec in policy.fields if spec.remember)
+        for policy in self.policies:
+            for rule in (*policy.pre_conditions, *policy.post_conditions):
+                unknown = sorted(rule.remembered_names() - remembered[policy.agent_id])
+                if unknown:
+                    raise ValueError(
+                        f"policy {policy.policy_id}: rule {rule.rule_name} reads "
+                        f"{', '.join('remembered.' + name for name in unknown)}, but agent {policy.agent_id} "
+                        "has no remember: true field of that name"
+                    )
         return self

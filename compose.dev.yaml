@@ -1,5 +1,7 @@
 # Development override: demo and debug routes, live source mounts, demo agents
 # and the test runner. The agents start once the proxy answers /health.
+# compose.yaml reads .env, so create it first (cp .env.example .env). Then either pass
+# both files, or set COMPOSE_FILE=compose.yaml:compose.dev.yaml in .env and drop the -f flags:
 #   docker compose -f compose.yaml -f compose.dev.yaml up --build
 x-dev-build: &dev-build
   context: .
@@ -22,6 +24,8 @@ services:
     volumes:
       - ./src:/src/statelock/src
       - ./policies:/app/policies:ro
+      # The OJS policy and rule module below load from here: edits apply on restart, no rebuild.
+      - ./examples:/app/examples:ro
       - ./artifacts:/app/artifacts
       # Public development keys (docker/dev-keys.yaml); the demo agents use slk_dev_<agent_id>.
       - ./docker/dev-keys.yaml:/app/keys.yaml:ro
@@ -61,8 +65,8 @@ services:
     environment:
       <<: *agent-env
       STATELOCK_API_KEY: slk_dev_finance_reconciliation_agent
-      STATELOCK_FINANCE_DEMO_URL: http://statelock:8000/demo/finance?scenario=mismatch
-      STATELOCK_EXPECT_BLOCK: "true"
+      DEMO_FINANCE_SCENARIO: mismatch
+      DEMO_EXPECT_BLOCK: "true"
     command: python /app/examples/finance_agent.py
 
   finance-pass-agent:
@@ -74,8 +78,8 @@ services:
     environment:
       <<: *agent-env
       STATELOCK_API_KEY: slk_dev_finance_reconciliation_agent
-      STATELOCK_FINANCE_DEMO_URL: http://statelock:8000/demo/finance?scenario=match
-      STATELOCK_EXPECT_BLOCK: "false"
+      DEMO_FINANCE_SCENARIO: match
+      DEMO_EXPECT_BLOCK: "false"
     command: python /app/examples/finance_agent.py
 
   portal-agent:
@@ -87,9 +91,9 @@ services:
     environment:
       <<: *agent-env
       STATELOCK_API_KEY: slk_dev_portal_reconciliation_agent
-      STATELOCK_PORTAL_BASE: http://statelock:8000
-      STATELOCK_PORTAL_SCENARIO: match
-      STATELOCK_EXPECT_BLOCK: "false"
+      DEMO_PORTAL_BASE: http://statelock:8000
+      DEMO_PORTAL_SCENARIO: match
+      DEMO_EXPECT_BLOCK: "false"
     command: python /app/examples/portal_agent.py
 
   portal-block-agent:
@@ -101,9 +105,9 @@ services:
     environment:
       <<: *agent-env
       STATELOCK_API_KEY: slk_dev_portal_reconciliation_agent
-      STATELOCK_PORTAL_BASE: http://statelock:8000
-      STATELOCK_PORTAL_SCENARIO: mismatch
-      STATELOCK_EXPECT_BLOCK: "true"
+      DEMO_PORTAL_BASE: http://statelock:8000
+      DEMO_PORTAL_SCENARIO: mismatch
+      DEMO_EXPECT_BLOCK: "true"
     command: python /app/examples/portal_agent.py
 
   # Invoice over the review threshold: the agent waits until a reviewer approves or
@@ -117,14 +121,15 @@ services:
     environment:
       <<: *agent-env
       STATELOCK_API_KEY: slk_dev_portal_reconciliation_agent
-      STATELOCK_PORTAL_BASE: http://statelock:8000
-      STATELOCK_PORTAL_SCENARIO: large
-      STATELOCK_EXPECT_BLOCK: "false"
+      DEMO_PORTAL_BASE: http://statelock:8000
+      DEMO_PORTAL_SCENARIO: large
+      DEMO_EXPECT_BLOCK: "false"
     command: python /app/examples/portal_agent.py
 
   # OJS demo (examples/ojs): a Stagehand agent screening papers on a mock OJS journal.
   # The agent holds no password (Statelock types {{secret:ojs_password}}) and keeps its
   # login in a saved session. Results and manuscripts go to ./ojs-output.
+  # These commands assume COMPOSE_FILE=compose.yaml:compose.dev.yaml in .env:
   #   docker compose --profile ojs-agent run --rm ojs-agent          # dry run: screens 101-103, fills and cancels the decline of 102
   #   docker compose --profile ojs-record-agent run --rm ojs-record-agent   # records the decline of 102 (in the mock)
   #   docker compose --profile ojs-block-agent run --rm ojs-block-agent    # tries "Send to Review": blocked, the session ends
@@ -193,15 +198,19 @@ services:
     working_dir: /src/statelock
     command: python -m pytest -q -p no:cacheprovider
 
-  # A local vision model for visual_assert, and the fixture test against it (profile vlm):
+  # A local vision model for visual_assert, and the fixture test against it (profile vlm,
+  # compose.dev.yaml alone: these services do not need the proxy):
   #   docker compose -f compose.dev.yaml --profile vlm up -d ollama
   #   docker compose -f compose.dev.yaml --profile vlm run --rm ollama-pull       # download, with progress (once)
   #   docker compose -f compose.dev.yaml --profile vlm run --rm perception-tests
-  # STATELOCK_VLM_MODEL picks the model (default qwen2.5vl:3b, about 4 GB of memory;
+  # DEMO_VLM_MODEL picks the model (default qwen2.5vl:3b, about 4 GB of memory;
   # qwen2.5vl:7b needs about 8 GB in Docker Desktop's resources). Docker on a Mac has no
   # GPU, so the model runs on the CPU: same answers, much slower than native Ollama.
+  # The test checks that the model answers in the expected form and prints its answers;
+  # set DEMO_VLM_CHECK_ANSWERS=true to also require correct ones (a 3B model can misjudge).
+  # Pinned, like every other image here; 0.35.0 is a recent release: move it on deliberately.
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.35.0
     profiles: [vlm]
     ports: ["127.0.0.1:11434:11434"]
     volumes:
@@ -213,13 +222,13 @@ services:
       retries: 30
 
   ollama-pull:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.35.0
     profiles: [vlm]
     depends_on:
       ollama: {condition: service_healthy}
     environment:
       OLLAMA_HOST: http://ollama:11434
-    entrypoint: ["ollama", "pull", "${STATELOCK_VLM_MODEL:-qwen2.5vl:3b}"]
+    entrypoint: ["ollama", "pull", "${DEMO_VLM_MODEL:-qwen2.5vl:3b}"]
 
   perception-tests:
     image: statelock-dev
@@ -228,10 +237,11 @@ services:
     depends_on:
       ollama-pull: {condition: service_completed_successfully}
     environment:
-      STATELOCK_PERCEPTION_MODEL: ollama_chat/${STATELOCK_VLM_MODEL:-qwen2.5vl:3b}
+      STATELOCK_PERCEPTION_MODEL: ollama_chat/${DEMO_VLM_MODEL:-qwen2.5vl:3b}
       STATELOCK_PERCEPTION_API_BASE: http://ollama:11434
       STATELOCK_PERCEPTION_LOCAL_ONLY: "true"   # the screenshots stay inside the Docker network
       STATELOCK_PERCEPTION_TIMEOUT: "300"       # seconds per call: CPU inference is slow
+      PERCEPTION_CHECK_ANSWERS: ${DEMO_VLM_CHECK_ANSWERS:-false}
     volumes:
       - ./src:/src/statelock/src
       - ./tests:/src/statelock/tests

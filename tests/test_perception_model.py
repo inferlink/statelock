@@ -6,6 +6,11 @@ compose.dev.yaml):
 
     STATELOCK_PERCEPTION_MODEL=ollama_chat/qwen2.5vl:7b \\
     STATELOCK_PERCEPTION_API_BASE=http://localhost:11434 pytest tests/test_perception_model.py
+
+Whether the model answers in the expected form is always checked. Whether it judges and
+reads each fixture correctly is checked too, unless PERCEPTION_CHECK_ANSWERS=false: the
+Compose demo sets that for the small default model, whose answers are only printed (a
+3B model reads the amounts but can misjudge them).
 """
 
 from __future__ import annotations
@@ -27,6 +32,8 @@ from statelock.settings import Settings
 
 FIXTURES = Path(__file__).parent / "fixtures" / "perception"
 SPEC = json.loads((FIXTURES / "cases.json").read_text(encoding="utf-8"))
+
+CHECK_ANSWERS = os.environ.get("PERCEPTION_CHECK_ANSWERS", "true").strip().lower() != "false"
 
 needs_model = pytest.mark.skipif(
     not os.environ.get("STATELOCK_PERCEPTION_MODEL"), reason="set STATELOCK_PERCEPTION_MODEL to test a real model"
@@ -57,9 +64,13 @@ def test_model_judges_the_fixture(case: dict[str, Any], capsys: pytest.CaptureFi
         print(
             f"\n  {verdict.meta.get('model')} {case['image']}: passed={verdict.passed} (expected {case['passed']}), "
             f"read={json.dumps(verdict.extracted)}, {verdict.meta.get('latency_ms')} ms, "
-            f"attempts={verdict.meta.get('attempts')}"
+            f"attempts={verdict.meta.get('attempts')}" + ("" if CHECK_ANSWERS else " (answer not checked)")
         )
+    # The model answered, in the expected form.
     assert not verdict.meta.get("failed_closed"), verdict.meta
+    assert set(case["extracted"]) <= set(verdict.extracted), verdict.extracted
+    if not CHECK_ANSWERS:
+        return
     assert verdict.passed is case["passed"], verdict.reason
     for name, expected in case["extracted"].items():
         assert values_equal(str(verdict.extracted.get(name)), expected), (name, verdict.extracted)

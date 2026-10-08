@@ -11,6 +11,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from statelock.policy.perception import DEFAULT_RETRIES as DEFAULT_PERCEPTION_RETRIES
 from statelock.policy.perception import DEFAULT_TIMEOUT as DEFAULT_PERCEPTION_TIMEOUT
+from statelock.proxy.connection import DEFAULT_COMMAND_TIMEOUT
+
+# The longest a session URL stays usable, in seconds (POST /sessions and the server default).
+MAX_SESSION_URL_TTL = 3600
 
 
 class Settings(BaseSettings):
@@ -61,8 +65,8 @@ class Settings(BaseSettings):
     plugins: str = "auto"
 
     # Chromium.
-    chromium_host: str = "127.0.0.1"
     chromium_sandbox: bool = False  # the sandbox needs a non-root user and a permissive seccomp profile
+    chromium_start_timeout: float = Field(default=10.0, gt=0)  # seconds for Chromium to answer on its CDP pipe
 
     # Timing (seconds).
     capture_timeout: float = Field(default=2.5, gt=0)
@@ -70,7 +74,7 @@ class Settings(BaseSettings):
     held_response_timeout: float = Field(default=10.0, gt=0)
     violation_close_delay: float = Field(default=0.5, ge=0)
     guard_ready_timeout: float = Field(default=10.0, gt=0)
-    guard_command_timeout: float = Field(default=5.0, gt=0)
+    cdp_command_timeout: float = Field(default=DEFAULT_COMMAND_TIMEOUT, gt=0)  # each of Statelock's own CDP commands
     attribution_timeout: float = Field(default=1.0, gt=0)
     trusted_submit_window: float = Field(default=3.0, gt=0)
     agent_navigation_window: float = Field(default=10.0, gt=0)
@@ -83,11 +87,14 @@ class Settings(BaseSettings):
     replay_wait: float = Field(default=10.0, gt=0)
 
     violation_registry_size: int = Field(default=1000, gt=0)
-    session_url_ttl: int = Field(default=300, gt=0)
+    session_url_ttl: int = Field(default=300, gt=0, le=MAX_SESSION_URL_TTL)
 
     # Human review (rules with on_fail: review; see statelock/review).
     review_timeout: float = Field(default=300.0, gt=0)
     review_history_size: int = Field(default=1000, gt=0)
+
+    # Statelock.fetch requests (policy request_access) running at once in one session; more are declined.
+    max_concurrent_requests: int = Field(default=4, gt=0)
 
     # Governed uploads (Statelock.uploadFile*, then DOM.setFileInputFiles).
     upload_dir: Path | None = None  # base directory for per-session upload folders; default: system temp

@@ -2,15 +2,15 @@
 """Credential injection: the agent types a placeholder, Statelock types the secret.
 
 The agent fills a login field with ``{{secret:<name>}}`` (Playwright ``fill``, or
-any framework that sends ``Input.insertText``). After the action passes its
-pre-conditions, Statelock replaces the placeholder with the value on its way to
-the browser, but only where the secrets file allows it:
+any framework that sends ``Input.insertText`` or ``Input.imeSetComposition``).
+After the action passes its pre-conditions, Statelock replaces the placeholder
+with the value on its way to the browser, but only where the secrets file allows it:
 
     # STATELOCK_SECRETS_FILE
     secrets:
       - name: ojs_password
         agents: [ojs_screening_agent]            # who may use it
-        url_contains: https://journal.example.org/index.php/journal/login   # origin, then part of the path
+        url_contains: https://journal.example.org/index.php/journal/login   # origin, then the path or below it
         value_env: OJS_PASSWORD                  # or value_file: /run/secrets/ojs_password
         # password_fields_only: true             # default: only into password fields
 
@@ -37,7 +37,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from statelock.audit.redaction import SECRET_MARKER
-from statelock.core.urls import origin_and_path
+from statelock.core.urls import origin_and_path, url_in_scope
 from statelock.fileio import load_yaml_file
 
 PLACEHOLDER_RE = re.compile(r"\{\{secret:([A-Za-z0-9_.-]+)\}\}")
@@ -48,8 +48,8 @@ class SecretEntry(BaseModel):
 
     name: str = Field(pattern=r"^[A-Za-z0-9_.-]+$")
     agents: list[str] = Field(min_length=1)
-    # Where it may be typed: the page's origin must equal this one's, and the rest
-    # must be part of the page's path. Without the origin, a page on any host would do.
+    # Where it may be typed: the page's origin must equal this one's, and its path must
+    # be this path or continue it after a "/". Without the origin, any host would do.
     url_contains: str = Field(min_length=1)
     value_env: str | None = None
     value_file: Path | None = None
@@ -167,15 +167,9 @@ def _scope(url_contains: str) -> tuple[str, str] | None:
 
 
 def _in_scope(url_contains: str, url: str) -> bool:
-    """The page's origin is the scope's and its path is under the scope's path. Query and
-    fragment are never matched (whoever builds the link picks them)."""
-    scope, page = _scope(url_contains), origin_and_path(url)
-    return (
-        scope is not None
-        and page is not None
-        and page[0] == scope[0]
-        and re.search(re.escape(scope[1].rstrip("/")) + r"(?=/|$)", page[1]) is not None
-    )
+    """The page's origin is the scope's and its path is the scope's path or continues it
+    after a "/". Query and fragment are never matched (whoever builds the link picks them)."""
+    return _scope(url_contains) is not None and url_in_scope(url_contains, url)
 
 
 class SecretScrubber:
@@ -191,9 +185,6 @@ class SecretScrubber:
             if form and form not in self._needles:
                 self._needles.append(form)
         self._needles.sort(key=len, reverse=True)  # longest first
-
-    def __bool__(self) -> bool:
-        return bool(self._needles)
 
     def bytes(self, data: bytes) -> bytes:
         """Scrub raw bytes (for example a response body), matching the values' UTF-8 forms."""

@@ -26,3 +26,17 @@ export async function startServer() {
 }
 
 export const key = (agent) => `slk_test_${agent}`;
+
+/**
+ * A governed session for `agent`: a session URL, connectOverCDP, its first page.
+ * Pass `install` to patch Playwright's file APIs. close() never throws (the session may
+ * already have ended): call it in finally.
+ */
+export async function openSession(server, agent = "flow_agent", { install } = {}) {
+  const { chromium } = await import("playwright-core");
+  const { createSessionUrl } = await import("../dist/index.js");
+  const session = await createSessionUrl({ serverUrl: server.base, apiKey: key(agent) });
+  const browser = await chromium.connectOverCDP(session.cdpUrl);
+  if (install) await install(browser);
+  return { session, browser, page: browser.contexts()[0].pages()[0], close: () => browser.close().catch(() => undefined) };
+}

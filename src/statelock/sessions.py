@@ -29,13 +29,13 @@ from statelock.auth import Identity
 from statelock.dependencies import authenticated_identity
 from statelock.saved_sessions import NOT_CONFIGURED, SavedSessionError, SavedSessionKey
 from statelock.services import get_services
+from statelock.settings import MAX_SESSION_URL_TTL
 from statelock.tokens import TOKEN_PREFIX, TooManyPendingSessions
 
 logger = logging.getLogger(__name__)
 
 SESSIONS_PATH = "/sessions"
 TOKEN_RE = re.compile(r"slt_[A-Za-z0-9_-]+")
-MAX_TTL_SECONDS = 3600
 
 
 def redact_tokens(text: str) -> str:
@@ -74,7 +74,7 @@ class SessionRequest(BaseModel):
 
     # Only with authentication off: the agent the session is for (else the key decides).
     agent_id: str | None = None
-    ttl_seconds: int | None = Field(default=None, ge=1, le=MAX_TTL_SECONDS)
+    ttl_seconds: int | None = Field(default=None, ge=1, le=MAX_SESSION_URL_TTL)
     saved_session_name: str | None = Field(default=None, min_length=1, max_length=80)
     save_session: bool = False
 

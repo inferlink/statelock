@@ -33,13 +33,10 @@ from typing import Any, ClassVar
 from pydantic import Field
 
 from statelock.policy.rules import Rule, RuleContext, RuleFailure, register_rule
+from statelock.policy.text import normalize_text
 
 DEFAULT_DECISIONS = Path(__file__).with_name("demo_decisions.json")
 MIN_EMAIL_CHARS = 20
-
-
-def _normalized(text: str) -> str:
-    return " ".join(text.split()).casefold()
 
 
 def read_decision(decisions_file: Path, paper_id: int) -> dict[str, Any] | None:
@@ -82,7 +79,7 @@ class OjsDecision(Rule):
             return RuleFailure(f"Blocked: the decision source has no usable email for paper {paper_id}", evidence)
         if self.email_field is not None:
             typed = ctx.field(self.email_field) or ""
-            if _normalized(email) not in _normalized(typed):
+            if normalize_text(email) not in normalize_text(typed):
                 return RuleFailure(
                     f"Blocked: the email in the page is not the one the decision source has for paper {paper_id}",
                     evidence,

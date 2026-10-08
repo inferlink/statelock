@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from helpers import context_for, mouse_action, run
@@ -9,6 +10,7 @@ from statelock.core.enums import Decision
 from statelock.core.state import BrowserState
 from statelock.policy import PolicyBundle, PolicyEvaluator, load_policy_bundle
 from statelock.policy.fields import FieldSpec, ScopedField, SessionMemory, parse_number, resolve_fields
+from statelock.policy.rules import RULES, Rule, RuleContext, RuleFailure
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -183,6 +185,9 @@ def test_session_memory_keeps_latest_matching_value() -> None:
 # Rules ----------------------------------------------------------------------------------------
 
 
+DEPOSIT_FIELD = {"name": "deposit", "selector": "#d", "url_contains": "https://x/bank", "remember": True}
+
+
 def _remembered(value: str) -> dict:
     return {"deposit": {"value": value, "url": "https://x/bank", "source": "page_load"}}
 
@@ -191,6 +196,7 @@ def test_assert_field_equal_with_remembered_value() -> None:
     ev = _evaluator(
         {
             "agent_id": "agent",
+            "fields": [DEPOSIT_FIELD],
             "pre_conditions": [{"assert_field_equal": {"left": "remembered.deposit", "right": "inv"}}],
         }
     )
@@ -220,7 +226,7 @@ def test_assert_field_equal_with_remembered_value() -> None:
     ],
 )
 def test_assert_compare(rule: dict, fields: dict, decision: Decision) -> None:
-    ev = _evaluator({"agent_id": "agent", "pre_conditions": [{"assert_compare": rule}]})
+    ev = _evaluator({"agent_id": "agent", "fields": [DEPOSIT_FIELD], "pre_conditions": [{"assert_compare": rule}]})
     ctx = context_for(mouse_action(), element={"text": "x"}, extracted_fields=fields)
     ctx.remembered = _remembered("$5,000.00")
     assert run(ev.evaluate(ctx)).decision == decision
@@ -298,3 +304,75 @@ def test_assert_field_equal_compares_numbers_numerically() -> None:
     assert values_equal("5000", "$5,000.00")
     assert values_equal("INV-1042", "inv-1042")
     assert not values_equal("5000", "$5,000.01")
+
+
+# remembered.<name> references --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        {"assert_field_equal": {"left": "remembered.typo", "right": "inv"}},
+        {"assert_compare": {"left": "inv", "op": "<=", "right": "remembered.typo"}},
+        {
+            "visual_assert": {
+                "check_name": "c",
+                "instruction": "i",
+                "extract": {"amount": "string"},
+                "cross_check": [{"extracted": "amount", "field": "remembered.typo"}],
+            }
+        },
+    ],
+)
+def test_unknown_remembered_reference_is_rejected_at_load(rule: dict) -> None:
+    policy = {"agent_id": "agent", "fields": [DEPOSIT_FIELD], "pre_conditions": [rule]}
+    with pytest.raises(ValidationError, match=r"remembered\.typo"):
+        PolicyBundle.model_validate({"policies": [policy]})
+
+
+def test_remembered_reference_needs_a_remember_field_of_the_same_agent() -> None:
+    rule = {"assert_field_equal": {"left": "remembered.deposit", "right": "inv"}}
+    not_remembered = {**DEPOSIT_FIELD, "remember": False}
+    with pytest.raises(ValidationError, match=r"remembered\.deposit"):
+        PolicyBundle.model_validate(
+            {"policies": [{"agent_id": "agent", "fields": [not_remembered], "pre_conditions": [rule]}]}
+        )
+    with pytest.raises(ValidationError, match=r"remembered\.deposit"):
+        PolicyBundle.model_validate(
+            {
+                "policies": [
+                    {"agent_id": "other", "fields": [DEPOSIT_FIELD]},
+                    {"agent_id": "agent", "pre_conditions": [rule]},
+                ]
+            }
+        )
+    # Another policy of the same agent may define it.
+    PolicyBundle.model_validate(
+        {
+            "policies": [
+                {"agent_id": "agent", "target_url_contains": "/bank", "fields": [DEPOSIT_FIELD]},
+                {"agent_id": "agent", "target_url_contains": "/erp", "post_conditions": [rule]},
+            ]
+        }
+    )
+
+
+class ReadsRemembered(Rule):
+    rule_name: ClassVar[str] = "reads_remembered_test"
+    invoice_field: str
+
+    async def check(self, ctx: RuleContext) -> RuleFailure | None:  # noqa: ARG002
+        return None
+
+
+def test_custom_rule_remembered_references_are_checked(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(RULES, ReadsRemembered.rule_name, ReadsRemembered)
+    rule = {"reads_remembered_test": {"invoice_field": "remembered.typo"}}
+    with pytest.raises(ValidationError, match=r"remembered\.typo"):
+        PolicyBundle.model_validate({"policies": [{"agent_id": "agent", "pre_conditions": [rule]}]})
+
+
+@pytest.mark.parametrize(("pattern", "message"), [("(", "not a valid regex"), ("(a)(b)", "at most one group")])
+def test_field_pattern_is_checked_when_the_policy_loads(pattern: str, message: str) -> None:
+    with pytest.raises(ValidationError, match=message):
+        FieldSpec.model_validate({"name": "total", "selector": "#t", "pattern": pattern})

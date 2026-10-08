@@ -4,16 +4,13 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any
 
 from fastapi import WebSocket
-from websockets.asyncio.client import ClientConnection
 
 from statelock import events as event_names
 from statelock.audit.records import build_action_record, build_network_record
@@ -21,29 +18,28 @@ from statelock.audit.redaction import SECRET_MARKER, mask_secret_input
 from statelock.audit.sequencing import SequencedWriter, Slot
 from statelock.audit.sink import ArtifactSink
 from statelock.core.actions import (
-    DOWNLOAD_METHOD,
     FOCUS_METHODS,
     IME_METHOD,
-    MOUSE_METHOD,
     TEXT_METHOD,
     ActionKind,
     CdpAction,
-    parse_cdp_message,
+    KeyPresses,
+    is_activation_key,
+    is_enter_key,
     protocol_action,
 )
 from statelock.core.enums import SystemRule, TargetSelection
+from statelock.core.jsonutil import as_int, parse_cdp_message
 from statelock.core.state import ActionContext, BrowserState
 from statelock.core.verdict import PolicyVerdict
 from statelock.credentials import InjectionError, SecretScrubber, SecretStore
 from statelock.events import Events
 from statelock.policy.evaluator import PolicyEvaluator
 from statelock.policy.fields import SessionMemory
-from statelock.proxy.connection import CdpError
-from statelock.proxy.guard import ReplayTarget, violation_method, violation_reason
+from statelock.proxy.connection import CdpChannel
+from statelock.proxy.guard import violation_method, violation_reason
 from statelock.proxy.inspector import Inspector
-from statelock.proxy.memory import FieldMemoryWatcher
 from statelock.proxy.reporter import ViolationReporter
-from statelock.proxy.scripts import AgentScripts
 from statelock.proxy.targets import TargetRegistry
 from statelock.review.queue import Fingerprint, Review, ReviewQueue, ReviewStatus, fingerprints
 from statelock.settings import Settings
@@ -52,22 +48,8 @@ from statelock.wire import CLOSE_CODE_POST_CONDITION, CLOSE_CODE_PRE_CONDITION
 logger = logging.getLogger(__name__)
 
 HeldKey = tuple[str | None, int]
-# A replayed script click: (type, button, buttons, clickCount) of each mouse event.
-REPLAY_EVENTS = (
-    ("mouseMoved", "none", 0, 0),
-    ("mousePressed", "left", 1, 1),
-    ("mouseReleased", "left", 0, 1),
-)
-# Times one replayed event is located again when the element moved before it was sent.
-REPLAY_ATTEMPTS = 3
 # Typed text in which {{secret:name}} placeholders are replaced (Playwright fill sends insertText).
 SECRET_METHODS = frozenset({TEXT_METHOD, IME_METHOD})
-
-
-class _Replayed(Enum):
-    SENT = "sent"
-    MOVED = "moved"  # the element was no longer at the point; nothing was sent
-    ENDED = "ended"  # blocked: the session ends
 
 
 @dataclass(frozen=True)
@@ -104,29 +86,18 @@ def _deferred(verdict: PolicyVerdict) -> PolicyVerdict:
     return PolicyVerdict.allow(f"Allowed; review deferred to the next activation: {verdict.reason}", evidence)
 
 
-def _without_review(verdict: PolicyVerdict) -> PolicyVerdict:
-    """Downloads cannot wait for a reviewer: a review verdict blocks them."""
-    if not verdict.needs_review:
-        return verdict
-    return PolicyVerdict.block(
-        reason=f"{verdict.reason} (a download cannot wait for review)",
-        rule=verdict.rule or "",
-        policy_id=verdict.policy_id,
-        evidence=verdict.evidence,
-    )
-
-
 class ActionGovernor:
     """Per-session pipeline for everything that is governed and recorded.
 
     Each governed event is captured, evaluated and written in sequence order:
-    the agent's input actions (``govern_input``), refused protocol commands,
-    page guard violations, and downloads the page starts (this class is the
-    session's ``DownloadPolicy``). Remembered policy fields are updated from
-    every capture (see FieldMemoryWatcher for captures outside actions).
+    the agent's input actions (``govern_input``), commands Statelock answers or
+    refuses, page guard violations, and what the page starts (``govern_page_action``,
+    used by SessionDownloadPolicy). Replayed script clicks (ScriptClickReplayer)
+    use the same steps. Remembered policy fields are updated from every capture
+    (see FieldMemoryWatcher for captures outside actions).
 
-    It forwards governed input to the browser (``browser_ws``) and answers the
-    agent (``client_ws``) on the session's two WebSockets.
+    It forwards governed input on the agent's channel to the browser
+    (``agent_channel``) and answers the agent on its WebSocket (``client_ws``).
     """
 
     def __init__(
@@ -143,8 +114,9 @@ class ActionGovernor:
         targets: TargetRegistry,
         reporter: ViolationReporter,
         reviews: ReviewQueue,
-        browser_ws: ClientConnection,
+        agent_channel: CdpChannel,
         client_ws: WebSocket,
+        scrubber: SecretScrubber,
         memory: SessionMemory | None = None,
         secrets: SecretStore | None = None,
     ) -> None:
@@ -159,29 +131,19 @@ class ActionGovernor:
         self.targets = targets
         self.reporter = reporter
         self.reviews = reviews
-        self.browser_ws = browser_ws
+        self.agent_channel = agent_channel
         self.client_ws = client_ws
         self.secrets = secrets or SecretStore()
         # Values of the secrets this session injected: removed from the evidence and from
-        # everything the browser sends the agent (the bridge applies it to that stream).
-        self.scrubber = SecretScrubber()
+        # everything the agent receives (the session's scrubber, shared with the reporter and the bridge).
+        self.scrubber = scrubber
         # An approved press: its matching release passes without a second review.
         self._approval: _Approval | None = None
-        # Script clicks being replayed; the agent's next command waits for them.
-        self._replays = 0
-        self._replays_idle = asyncio.Event()
-        self._replays_idle.set()
-        # Agent code running per tab: tells the page guard which script clicks are the agent's.
-        self.scripts = AgentScripts(grace=settings.agent_script_grace)
-        self.writer = SequencedWriter(sink, events)
-        self.writer.scrub = self.scrubber.data
-        reporter.scrub = self.scrubber.data
+        self.writer = SequencedWriter(sink, events, scrub=scrubber.data)
         self.memory = memory or SessionMemory([])
-        self.field_watcher = FieldMemoryWatcher(session_id, self.memory, inspector, settings.memory_settle)
         self._held_responses: dict[HeldKey, asyncio.Future[str]] = {}
-
-    async def close(self) -> None:
-        await self.field_watcher.close()
+        # Pairs a char with the rawKeyDown that pressed its key (one activation, one commit).
+        self._keys = KeyPresses()
 
     # Capture --------------------------------------------------------------------------
 
@@ -208,10 +170,14 @@ class ActionGovernor:
             tenant_id=self.tenant_id,
         )
         context.remembered = self.memory.snapshot()
-        # Typing into a password, one-time-code or card field: keep the text out of the evidence.
+        # Typing into a password, one-time-code or card field, or into a frame Statelock
+        # cannot read (it may be one): keep the text out of the evidence. Enter (and Space,
+        # which activates in a frame) stays visible: rules and triggers check those keys.
         target = state.target_element
         if target is not None and target.source == "focus" and action.method in FOCUS_METHODS:
-            context.params = mask_secret_input(context.params, secret_target=target.is_secret_input)
+            keeps_key = is_activation_key(action.params) if target.unresolved else is_enter_key(action.params)
+            secret = (target.is_secret_input or target.unresolved) and not keeps_key
+            context.params = mask_secret_input(context.params, secret_target=secret)
         return context
 
     # Input actions --------------------------------------------------------------------
@@ -219,8 +185,9 @@ class ActionGovernor:
     async def govern_input(self, action: CdpAction, payload: dict[str, Any]) -> bool:
         """Govern one intercepted input action (``payload``: the agent's command, as evaluated).
         Returns False when the session ends."""
+        action = self._keys.annotate(action)
         async with self.writer.slot() as slot:
-            context, verdict, review = await self._decide_input(slot, action)
+            context, verdict, review = await self.decide_input(slot, action)
             state = context.browser_state
             logger.info(
                 "Intercepted %s action #%s session=%s method=%s verdict=%s url=%s",
@@ -245,7 +212,7 @@ class ActionGovernor:
                 return False
 
             if not action.is_commit:
-                await self.browser_ws.send(json.dumps(payload))
+                self.agent_channel.send(json.dumps(payload))
                 await slot.write(build_action_record(context, verdict, review=review))
                 return True
 
@@ -294,7 +261,7 @@ class ActionGovernor:
 
     # Human review ---------------------------------------------------------------------
 
-    async def _decide_input(
+    async def decide_input(
         self, slot: Slot, action: CdpAction, target_id: str | None = None
     ) -> tuple[ActionContext, PolicyVerdict, Review | None]:
         """Evaluate; when an on_fail: review rule failed, pause for a reviewer.
@@ -373,16 +340,16 @@ class ActionGovernor:
         """Commit actions (mouseReleased, Enter keyUp): hold the browser's response until
         post-conditions pass, so a failure is returned on the agent's own call."""
         held_response = await self._forward_and_hold(action, json.dumps(payload))
-        post_verdict = await self._post_check(slot, action, context)
+        post_verdict = await self.post_check(slot, action, context)
         await slot.write(build_action_record(context, verdict, post_verdict, review=review))
         if post_verdict is not None and post_verdict.blocked:
             await self.reporter.reject(action, context, post_verdict, CLOSE_CODE_POST_CONDITION)
             return False
         if held_response is not None and not self.reporter.client_closed:
-            await self.client_ws.send_text(self.scrubber.text(held_response) if self.scrubber else held_response)
+            await self.client_ws.send_text(self.scrubber.text(held_response))
         return True
 
-    async def _post_check(
+    async def post_check(
         self, slot: Slot, action: CdpAction, context: ActionContext, target_id: str | None = None
     ) -> PolicyVerdict | None:
         """After a commit: let the page settle, capture it, remember its fields, run post-conditions."""
@@ -393,13 +360,13 @@ class ActionGovernor:
 
     async def _forward_and_hold(self, action: CdpAction, message: str) -> str | None:
         if action.message_id is None:
-            await self.browser_ws.send(message)
+            self.agent_channel.send(message)
             return None
         key: HeldKey = (action.session_id, action.message_id)
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self._held_responses[key] = future
         try:
-            await self.browser_ws.send(message)
+            self.agent_channel.send(message)
             return await asyncio.wait_for(future, timeout=self.settings.held_response_timeout)
         except asyncio.TimeoutError:
             logger.warning("No browser response for held action in session %s", self.session_id)
@@ -407,149 +374,20 @@ class ActionGovernor:
         finally:
             self._held_responses.pop(key, None)
 
-    def claim_held_response(self, raw_message: str | bytes) -> bool:
+    def claim_held_response(self, raw_message: str) -> bool:
         """Route a browser response to a waiting commit action, if one is held."""
-        if not self._held_responses or isinstance(raw_message, bytes):
+        if not self._held_responses:
             return False
         payload = parse_cdp_message(raw_message)
-        if payload is None or not isinstance(payload.get("id"), int):
+        message_id = as_int((payload or {}).get("id"))
+        if payload is None or message_id is None:
             return False
         session_id = payload.get("sessionId")
-        future = self._held_responses.get((session_id if isinstance(session_id, str) else None, payload["id"]))
+        future = self._held_responses.get((session_id if isinstance(session_id, str) else None, message_id))
         if future is None or future.done():
             return False
         future.set_result(raw_message)
         return True
-
-    # Script clicks replayed as governed input ------------------------------------------
-
-    async def replay_script_click(self, target_id: str, event: dict[str, Any], target: ReplayTarget) -> None:
-        """Replay a click the agent's page code made (element.click()) as real mouse
-        input at the element, governed and recorded like the agent's own clicks.
-
-        An element a real click would not hit (covered, hidden, gone) is a violation.
-        """
-        if self.reporter.terminating:
-            return
-        self._replays += 1
-        self._replays_idle.clear()
-        try:
-            point = await self._locate(target)
-            if point is None:
-                await self.on_guard_violation(target_id, event)
-            else:
-                await self._replay_click(target_id, event, target, point)
-        except Exception:
-            logger.exception("Replaying a script click failed in session %s", self.session_id)
-        finally:
-            await target.release()
-            self._replays -= 1
-            if self._replays == 0:
-                self._replays_idle.set()
-
-    async def replays_done(self, timeout: float) -> None:
-        """Wait (bounded) until replayed script clicks finished, so the agent's next
-        command sees their effect."""
-        if self._replays:
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self._replays_idle.wait(), timeout=timeout)
-
-    async def _locate(self, target: ReplayTarget) -> dict[str, float] | None:
-        try:
-            return await target.locate()
-        except CdpError as error:
-            logger.warning("Could not locate a script-clicked element in session %s: %s", self.session_id, error)
-            return None
-
-    async def _replay_click(
-        self, target_id: str, event: dict[str, Any], target: ReplayTarget, point: dict[str, float]
-    ) -> None:
-        """Move, press and release at the element. Each event is captured and checked at its
-        point, and sent only if the element is still there (the layout can move between
-        events, e.g. a viewport resize); otherwise the element is located again."""
-        pages = self.inspector.pages
-        session_id = await pages.session_for(target_id)
-        replayed = {key: event.get(key) for key in ("event_type", "target", "url")}
-        pressed = False
-        for event_type, button, buttons, count in REPLAY_EVENTS:
-            outcome = _Replayed.MOVED
-            for _attempt in range(REPLAY_ATTEMPTS):
-                params = {"type": event_type, **point, "button": button, "buttons": buttons, "clickCount": count}
-                action = CdpAction(
-                    message_id=None,
-                    method=MOUSE_METHOD,
-                    kind=ActionKind.MOUSE,
-                    params={**params, "statelock_replayed_script_click": replayed},
-                )
-
-                async def send(params: dict[str, Any] = params) -> None:
-                    self.scripts.input_dispatched(target_id)
-                    await pages.connection.send(MOUSE_METHOD, params, session_id=session_id)
-
-                outcome = await self._govern_replayed(action, target_id, send, target)
-                if outcome is not _Replayed.MOVED:
-                    break
-                located = await self._locate(target)
-                if located is None:
-                    break
-                point = located
-            if outcome is _Replayed.ENDED:
-                return
-            if outcome is _Replayed.MOVED:
-                if not pressed:
-                    await self.on_guard_violation(target_id, event)  # nothing was clicked
-                    return
-                # The target moved after the press. Ending the session is the only
-                # safe outcome: releasing at the old point could click another element.
-                await self.on_guard_violation(target_id, event)
-                return
-            pressed = pressed or event_type == "mousePressed"
-
-    async def _govern_replayed(
-        self,
-        action: CdpAction,
-        target_id: str,
-        send: Callable[[], Awaitable[None]],
-        target: ReplayTarget | None,
-    ) -> _Replayed:
-        """Govern one replayed mouse event. With ``target``, it is sent only if the element
-        is still at the event's point when the checks are done."""
-        point = {"x": action.params["x"], "y": action.params["y"]}
-        async with self.writer.slot() as slot:
-            context, verdict, review = await self._decide_input(slot, action, target_id)
-            if self.reporter.terminating:
-                await slot.write(build_action_record(context, verdict, review=review))
-                return _Replayed.ENDED
-            if verdict.blocked:
-                await self.reporter.terminate(context, verdict, CLOSE_CODE_PRE_CONDITION)
-                await slot.write(build_action_record(context, verdict, review=review))
-                return _Replayed.ENDED
-            if target is not None and not await self._still_hits(target, point):
-                context.params = {**context.params, "statelock_replay_not_sent": "element_moved"}
-                moved = PolicyVerdict.allow(
-                    "Not sent: the element moved before the replayed event; Statelock locates it again",
-                    verdict.evidence,
-                )
-                await slot.write(build_action_record(context, moved, review=review))
-                return _Replayed.MOVED
-            await send()
-            post_verdict = await self._post_check(slot, action, context, target_id) if action.is_commit else None
-            if post_verdict is not None and post_verdict.blocked:
-                await self.reporter.terminate(context, post_verdict, CLOSE_CODE_POST_CONDITION)
-            await slot.write(build_action_record(context, verdict, post_verdict, review=review))
-        logger.info(
-            "Replayed script click %s session=%s verdict=%s",
-            action.params.get("type"),
-            self.session_id,
-            verdict.decision.value,
-        )
-        return _Replayed.ENDED if post_verdict is not None and post_verdict.blocked else _Replayed.SENT
-
-    async def _still_hits(self, target: ReplayTarget, point: dict[str, float]) -> bool:
-        try:
-            return await target.hits(point)
-        except CdpError:
-            return False
 
     # Commands Statelock answers itself or refuses ------------------------------------
 
@@ -557,10 +395,7 @@ class ActionGovernor:
         """Record a command Statelock answered itself (allowed or declined), without
         ending the session. The caller answers the agent."""
         action = protocol_action(payload)
-        async with self.writer.slot() as slot:
-            state = await self.capture(action)
-            context = self._context(slot.sequence, action, state)
-            location = await slot.write(build_action_record(context, verdict))
+        _context, location = await self._record_command(action, verdict)
         logger.info(
             "Answered CDP command session=%s method=%s decision=%s at %s",
             self.session_id,
@@ -586,10 +421,7 @@ class ActionGovernor:
         action = protocol_action(payload)
         if verdict is None:
             verdict = PolicyVerdict.block(reason=reason, rule=rule, evidence={"method": action.method})
-        async with self.writer.slot() as slot:
-            state = await self.capture(action)
-            context = self._context(slot.sequence, action, state)
-            location = await slot.write(build_action_record(context, verdict))
+        context, location = await self._record_command(action, verdict)
         logger.warning(
             "Refused CDP command session=%s method=%s rule=%s at %s",
             self.session_id,
@@ -602,9 +434,17 @@ class ActionGovernor:
         else:
             await self.reporter.terminate(context, verdict, CLOSE_CODE_PRE_CONDITION, answer=action)
 
-    # Downloads (started by the page, governed like actions; DownloadPolicy) ---------------
+    async def _record_command(self, action: CdpAction, verdict: PolicyVerdict) -> tuple[ActionContext, str]:
+        """Capture the command's tab and write its record. Returns the context and the record's location."""
+        async with self.writer.slot() as slot:
+            state = await self.capture(action)
+            context = self._context(slot.sequence, action, state)
+            location = await slot.write(build_action_record(context, verdict))
+        return context, location
 
-    async def _govern_browser_action(
+    # Events the page starts (downloads) -----------------------------------------------
+
+    async def govern_page_action(
         self,
         action: CdpAction,
         target_id: str | None,
@@ -615,7 +455,7 @@ class ActionGovernor:
             state = await self.capture(action, target_id)
             self.memory.update(state, "action", slot.sequence)
             context = self._context(slot.sequence, action, state)
-            verdict = _without_review(await decide(context))
+            verdict = await decide(context)
             if verdict.blocked and not self.reporter.terminating:
                 await self.reporter.terminate(context, verdict, CLOSE_CODE_PRE_CONDITION)
             location = await slot.write(build_action_record(context, verdict))
@@ -628,35 +468,6 @@ class ActionGovernor:
             location,
         )
         return verdict, state.url
-
-    @staticmethod
-    def _download_action(params: dict[str, Any]) -> CdpAction:
-        return CdpAction(message_id=None, method=DOWNLOAD_METHOD, kind=ActionKind.DOWNLOAD, params=params)
-
-    async def download_begin(self, params: dict[str, Any], frame_id: str | None) -> tuple[bool, str | None]:
-        # A download from an in-process iframe has no target of its own: use the tab heuristic.
-        target_id = await self.inspector.resolve_frame_target(frame_id)
-        verdict, url = await self._govern_browser_action(
-            self._download_action(params), target_id, self.evaluator.evaluate
-        )
-        return not verdict.blocked, url
-
-    async def download_complete(self, params: dict[str, Any], begin_url: str | None) -> bool:
-        async def decide(context: ActionContext) -> PolicyVerdict:
-            return await self.evaluator.evaluate_download_completion(context, begin_url)
-
-        verdict, _ = await self._govern_browser_action(self._download_action(params), None, decide)
-        return not verdict.blocked
-
-    async def download_limit(self, reason: str, params: dict[str, Any]) -> None:
-        async def decide(_context: ActionContext) -> PolicyVerdict:
-            return PolicyVerdict.block(
-                reason=f"Blocked download: {reason}",
-                rule=SystemRule.DOWNLOAD_LIMIT.value,
-                evidence={"download": params},
-            )
-
-        await self._govern_browser_action(self._download_action(params), None, decide)
 
     # Page guard callbacks -----------------------------------------------------------
 

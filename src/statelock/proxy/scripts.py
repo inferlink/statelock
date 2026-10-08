@@ -14,15 +14,13 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from statelock.core.actions import parse_cdp_message
-from statelock.core.jsonutil import as_dict, as_str
+from statelock.core.jsonutil import as_dict, as_int, as_str, parse_cdp_message
+from statelock.proxy.connection import DETACHED_EVENT
 
 SCRIPT_METHODS = {"Runtime.evaluate", "Runtime.callFunctionOn"}
 # A script whose response never came (its tab closed, the agent stopped waiting) stops
 # counting as running after this. Expiring is safe: its clicks are then blocked, not replayed.
 MAX_RUNNING_SECONDS = 60.0
-
-DETACHED_EVENT = "Target.detachedFromTarget"
 
 ScriptKey = tuple[str | None, int]
 
@@ -41,9 +39,9 @@ class AgentScripts:
         if payload.get("method") in SCRIPT_METHODS and target_id is not None and isinstance(message_id, int):
             self._running[(as_str(payload.get("sessionId")), message_id)] = (target_id, time.monotonic())
 
-    def observe(self, raw_message: str | bytes) -> None:
+    def observe(self, raw_message: str) -> None:
         """Note a browser -> agent message: a running script's response, or a detached session."""
-        if not self._running or isinstance(raw_message, bytes):
+        if not self._running:
             return
         detached = DETACHED_EVENT in raw_message
         if not detached and '"id"' not in raw_message:
@@ -57,8 +55,8 @@ class AgentScripts:
             for key in [key for key in self._running if key[0] == session_id]:
                 del self._running[key]
             return
-        message_id = payload.get("id")
-        if not isinstance(message_id, int):
+        message_id = as_int(payload.get("id"))
+        if message_id is None:
             return
         running = self._running.pop((as_str(payload.get("sessionId")), message_id), None)
         if running is not None:

@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import base64
 import json
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
-from playwright.async_api import Page
+from playwright.async_api import APIRequestContext, Page
 
-from statelock.client.files import cdp_session
+from statelock.client.files import cdp_session, statelock_session
 from statelock.wire import REQUEST_COMMAND, VIOLATION_MARKER
 
 
@@ -135,13 +136,11 @@ class GovernedRequestContext:
     """What ``page.request`` / ``context.request`` return after install(): governed requests
     on a Statelock browser, Playwright's own APIRequestContext elsewhere."""
 
-    def __init__(self, page_of: Any, original: Any) -> None:
-        self._page_of = page_of  # () -> Page | None
+    def __init__(self, page_of: Callable[[], Page | None], original: APIRequestContext) -> None:
+        self._page_of = page_of
         self._original = original
 
     async def _governed_page(self) -> Page | None:
-        from statelock.client.install import statelock_session  # noqa: PLC0415 - import cycle
-
         page = self._page_of()
         return page if page is not None and await statelock_session(page) else None
 
@@ -151,7 +150,7 @@ class GovernedRequestContext:
             return await self._original.fetch(url_or_request, **kwargs)
         if not isinstance(url_or_request, str):
             raise StatelockRequestError("page.request.fetch through Statelock takes a URL string")
-        return await _governed(page, url_or_request, kwargs.pop("method", None) or "GET", kwargs)
+        return await _governed_fetch(page, url_or_request, kwargs.pop("method", None) or "GET", kwargs)
 
     def __getattr__(self, name: str) -> Any:
         method = _METHODS.get(name)
@@ -163,12 +162,12 @@ class GovernedRequestContext:
             page = await self._governed_page()
             if page is None:
                 return await original(url, **kwargs)
-            return await _governed(page, url, method, kwargs)
+            return await _governed_fetch(page, url, method, kwargs)
 
         return call
 
 
-async def _governed(page: Page, url: str, method: str, kwargs: dict[str, Any]) -> StatelockResponse:
+async def _governed_fetch(page: Page, url: str, method: str, kwargs: dict[str, Any]) -> StatelockResponse:
     unsupported = [name for name in _UNSUPPORTED if kwargs.get(name) not in (None, False)]
     if unsupported:
         raise StatelockRequestError(f"not supported through Statelock: {', '.join(unsupported)}")

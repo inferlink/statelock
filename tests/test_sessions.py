@@ -9,13 +9,14 @@ from pathlib import Path
 import pytest
 import yaml
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from statelock.app import create_app
 from statelock.auth import Identity, hash_key
 from statelock.client import sessions as client_sessions
 from statelock.saved_sessions import SavedSessionKey
 from statelock.sessions import install_log_redaction, redact_tokens
-from statelock.settings import Settings
+from statelock.settings import MAX_SESSION_URL_TTL, Settings
 from statelock.tokens import MAX_PENDING_PER_AGENT, SessionTokens, TooManyPendingSessions
 
 AGENT = "finance_reconciliation_agent"  # registered in the policy_file fixture
@@ -96,11 +97,11 @@ def test_client_requests_saved_sessions(policy_file: Path, tmp_path: Path, monke
         assert response.status_code == 200, response.text
         return dict(response.json())
 
-    monkeypatch.setattr(client_sessions, "_call", call)
+    monkeypatch.setattr(client_sessions, "request_json", call)
     url = client_sessions.create_session_url("http://x", saved_session="bank-login", save_session=True)
     assert url.saved_session == "bank-login"
     assert calls[0][2] == {"saved_session_name": "bank-login", "save_session": True}
-    with pytest.raises(client_sessions.SessionUrlError):
+    with pytest.raises(client_sessions.StatelockClientError):
         client_sessions.create_session_url("http://x", save_session=True)
 
     client.app.state.services.saved_sessions.save_payload(SavedSessionKey("acme", AGENT, "bank-login"), {})
@@ -185,3 +186,9 @@ def test_an_agent_holds_a_bounded_number_of_unused_urls() -> None:
     with pytest.raises(TooManyPendingSessions):
         tokens.issue(identity, ttl_seconds=60)
     tokens.issue(Identity(agent_id="b", tenant="t", authenticated=True), ttl_seconds=60)  # others are not affected
+
+
+def test_server_default_session_url_ttl_is_capped_like_requests() -> None:
+    assert Settings(session_url_ttl=MAX_SESSION_URL_TTL).session_url_ttl == MAX_SESSION_URL_TTL
+    with pytest.raises(ValidationError, match="session_url_ttl"):
+        Settings(session_url_ttl=MAX_SESSION_URL_TTL + 1)

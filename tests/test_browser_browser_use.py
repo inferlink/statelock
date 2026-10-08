@@ -27,7 +27,7 @@ AGENT = "finance_reconciliation_agent"
 
 async def _click_mark_as_paid(server: dict[str, Any], scenario: str) -> tuple[BrowserUseSession, str | None]:
     """Open the finance demo in browser-use and click "Mark as Paid". Returns (session, click error)."""
-    governed = create_browser_use_session(server["base"], api_key=agent_key(AGENT))
+    governed = await create_browser_use_session(server["base"], api_key=agent_key(AGENT))
     browser = governed.browser
     try:
         await browser.start()
@@ -50,9 +50,9 @@ async def _click_mark_as_paid(server: dict[str, Any], scenario: str) -> tuple[Br
 async def _released(server: dict[str, Any], session_id: str) -> None:
     """Wait until the click's mouse release is recorded."""
     deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        if any(r["context"]["params"].get("type") == "mouseReleased" for r in actions(server, session_id)):
-            return
+    while not any(r["context"]["params"].get("type") == "mouseReleased" for r in actions(server, session_id)):
+        if time.monotonic() > deadline:
+            raise AssertionError("the click's mouse release was not recorded within 10 s")
         await asyncio.sleep(0.05)
 
 

@@ -10,7 +10,11 @@ from helpers import context_for, run
 from statelock.core.actions import ActionKind, CdpAction
 from statelock.core.enums import Decision
 from statelock.policy import PolicyBundle, PolicyEvaluator
-from statelock.proxy.downloads import DownloadError, SessionDownloads
+from statelock.proxy.downloads import DownloadCheck, DownloadError, SessionDownloads
+
+
+def _check(*, allowed: bool) -> DownloadCheck:
+    return DownloadCheck(allowed=True) if allowed else DownloadCheck(allowed=False, rule="restrict_downloads")
 
 
 class Harness:
@@ -27,12 +31,12 @@ class Harness:
 
     async def download_begin(self, params, frame_id):
         self.begins.append({**params, "frame_id": frame_id})
-        return self.allow_begin, "https://portal.test/docs"
+        return _check(allowed=self.allow_begin), "https://portal.test/docs"
 
     async def download_complete(self, params, begin_url):
         self.completes.append({**params, "begin_url": begin_url})
         await asyncio.sleep(0.01)  # let concurrent completions interleave
-        return self.allow_complete
+        return _check(allowed=self.allow_complete)
 
     async def download_limit(self, reason, params):
         self.limits.append(f"{reason} ({params['phase']})")
@@ -98,7 +102,7 @@ def test_allowed_download_is_hashed_and_readable(tmp_path: Path) -> None:
         return h, listing, read
 
     h, listing, read = run(scenario())
-    assert listing["g1"]["state"] == "completed"
+    assert listing["g1"]["state"] == "completed" and listing["g1"]["rule"] is None
     assert listing["g1"]["sha256"] == hashlib.sha256(b"0123456789").hexdigest()
     assert base64.b64decode(read["data"]) == b"2345"
     assert h.begins[0]["phase"] == "begin"
@@ -124,6 +128,7 @@ def test_blocked_download_is_cancelled_and_never_readable(tmp_path: Path, blocke
 
     h, listing, exists = run(scenario())
     assert listing["g1"]["state"] == "blocked"
+    assert listing["g1"]["rule"] == "restrict_downloads"  # the rule that blocked it, for the SDKs
     assert not exists
     if not allow_begin:
         assert ("Browser.cancelDownload", {"guid": "g1"}) in h.sent
@@ -140,6 +145,7 @@ def test_system_limits_cancel_the_download(tmp_path: Path) -> None:
     h, listing = run(scenario())
     assert listing["big"]["state"] == "blocked"
     assert "download limit of 5" in listing["big"]["reason"]
+    assert listing["big"]["rule"] == "download_limit"
     assert h.limits and "download limit" in h.limits[0]
     assert listing["ok"]["state"] == "completed"
 
@@ -313,3 +319,20 @@ def test_default_context_id_maps_to_the_default_configuration(tmp_path: Path) ->
     behaviors = [params for method, params in sent if method == "Browser.setDownloadBehavior"]
     assert len(behaviors) == 2  # start, and the agent's request; none for the default id itself
     assert all("browserContextId" not in params for params in behaviors)
+
+
+def test_a_check_that_could_not_run_blocks_without_a_rule(tmp_path: Path) -> None:
+    async def scenario():
+        h = Harness(tmp_path)
+
+        async def broken(params, frame_id):
+            raise RuntimeError("capture crashed")
+
+        h.download_begin = broken
+        await h.download("g1", b"data")
+        listing = await h.listing()
+        await h.downloads.close()
+        return listing
+
+    listing = run(scenario())
+    assert listing["g1"]["state"] == "blocked" and listing["g1"]["rule"] is None

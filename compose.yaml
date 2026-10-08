@@ -1,6 +1,6 @@
-# Statelock proxy. Create keys.yaml first (statelock keygen --agent-id ID --append keys.yaml);
-# Compose does not start without it. For demos, agents and tests, add compose.dev.yaml
-# (see .env.example).
+# Statelock proxy. Create .env (cp .env.example .env) and keys.yaml
+# (statelock keygen --agent-id ID --append keys.yaml) first; Compose does not start
+# without them. For demos, agents and tests, add compose.dev.yaml (see .env.example).
 services:
   statelock:
     build:
@@ -28,6 +28,10 @@ services:
         read_only: true
         bind:
           create_host_path: false
+    # Proxy settings (STATELOCK_*, README "Configuration") come from .env, so it must exist:
+    # cp .env.example .env. The entries under environment: take precedence: they are paths
+    # inside the container.
+    env_file: .env
     environment:
       - STATELOCK_POLICY_FILE=/app/policies/default.yaml
       - STATELOCK_ARTIFACT_DIR=/app/artifacts

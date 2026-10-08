@@ -12,7 +12,14 @@ import pytest
 
 pytest.importorskip("playwright.async_api")
 
-from browser_support import StatelockPolicyViolationError, actions, chromium_available, run_session, running_server
+from browser_support import (
+    WAIT_MS,
+    StatelockPolicyViolationError,
+    actions,
+    chromium_available,
+    run_session,
+    running_server,
+)
 
 from statelock.policy.perception import LiteLLMPerceptionEvaluator
 
@@ -75,7 +82,7 @@ def fresh_model(model: ScriptedModel, evaluator: LiteLLMPerceptionEvaluator) -> 
 
 async def _click(page: Any) -> str:
     await page.click("text=Mark as Paid")
-    await page.wait_for_selector("text=Reconciliation complete", timeout=5000)
+    await page.wait_for_selector("text=Reconciliation complete", timeout=WAIT_MS)
     return "paid"
 
 

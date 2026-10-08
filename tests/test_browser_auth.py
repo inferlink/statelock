@@ -14,10 +14,12 @@ from browser_support import (
     StatelockPolicyViolationError,
     actions,
     agent_key,
-    connect_statelock,
+    connect_with_headers,
     playwright_api,
     run_session,
 )
+
+from statelock.wire import CLOSE_CODE_UNREGISTERED_AGENT
 
 pytestmark = pytest.mark.browser
 
@@ -26,13 +28,15 @@ def test_playwright_with_a_wrong_key_cannot_connect(server: dict[str, Any]) -> N
     async def attempt() -> BaseException | None:
         async with playwright_api.async_playwright() as p:
             try:
-                conn = await connect_statelock(p, server["ws"], "flow_agent", api_key="slk_wrong")
+                conn = await connect_with_headers(p, server["ws"], "flow_agent", api_key="slk_wrong")
             except Exception as error:
                 return error
             await conn.browser.close()
             return None
 
-    assert asyncio.run(attempt()) is not None
+    error = asyncio.run(attempt())
+    assert error is not None
+    assert f"code={CLOSE_CODE_UNREGISTERED_AGENT}" in str(error)  # refused by authentication, not just any failure
 
 
 def test_violation_details_need_the_agents_key(server: dict[str, Any]) -> None:

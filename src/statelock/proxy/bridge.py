@@ -9,36 +9,39 @@ import dataclasses
 import json
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
-import websockets
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
-from websockets.asyncio.client import ClientConnection
 
 from statelock import events as event_names
 from statelock.auth import AUTHORIZATION_HEADER, AuthError, Identity
-from statelock.core.actions import FILE_UPLOAD_METHOD, CdpAction, classify_cdp_action, parse_cdp_message
+from statelock.core.actions import FILE_UPLOAD_METHOD, CdpAction, classify_cdp_action
 from statelock.core.enums import SystemRule
-from statelock.core.jsonutil import as_dict, as_str
+from statelock.core.jsonutil import as_dict, as_str, parse_cdp_message
 from statelock.credentials import SecretScrubber
 from statelock.policy.fields import SessionMemory
 from statelock.proxy.attribution import tag_agent_code
+from statelock.proxy.browser import GovernedBrowser
 from statelock.proxy.commands import AGENT_NAVIGATION_METHODS, refused_command
-from statelock.proxy.connection import CdpConnection, CdpError
+from statelock.proxy.connection import BrowserClosedError, CdpChannel, CdpConnection, CdpError
 from statelock.proxy.cookies import COOKIE_METHODS, CookieReads
+from statelock.proxy.download_policy import SessionDownloadPolicy
 from statelock.proxy.downloads import AGENT_BEHAVIOR_METHODS, SessionDownloads
 from statelock.proxy.downloads import COMMANDS as DOWNLOAD_COMMANDS
 from statelock.proxy.files import LocalCommandError
 from statelock.proxy.governor import ActionGovernor
 from statelock.proxy.guard import GuardTimings, PageGuard
 from statelock.proxy.inspector import Inspector
+from statelock.proxy.memory import FieldMemoryWatcher
 from statelock.proxy.network_filter import filter_network_message
 from statelock.proxy.pages import PageSessions
+from statelock.proxy.replay import ScriptClickReplayer
 from statelock.proxy.reporter import ViolationReporter
-from statelock.proxy.requests import GovernedRequests
+from statelock.proxy.requests import FetchOutcome, GovernedRequests
+from statelock.proxy.scripts import AgentScripts
 from statelock.proxy.targets import TargetRegistry
 from statelock.proxy.uploads import COMMANDS as UPLOAD_COMMANDS
 from statelock.proxy.uploads import SessionUploads, UploadError
@@ -48,8 +51,10 @@ from statelock.services import Services
 from statelock.wire import (
     AGENT_ID_HEADER,
     AGENT_ID_QUERY_PARAM,
+    CLOSE_CODE_INTERNAL_ERROR,
     CLOSE_CODE_INVALID_SESSION_ID,
     CLOSE_CODE_UNREGISTERED_AGENT,
+    PARSE_ERROR,
     REQUEST_COMMAND,
     SESSION_COMMAND,
     SESSION_ID_HEADER,
@@ -63,7 +68,7 @@ logger = logging.getLogger(__name__)
 
 # The answer to a message that is not a JSON object (Chromium answers id 0 too). It is not forwarded.
 NOT_JSON_RESPONSE = json.dumps(
-    {"id": 0, "error": {"code": -32700, "message": "Statelock: a CDP message must be a JSON object"}}
+    {"id": 0, "error": {"code": PARSE_ERROR, "message": "Statelock: a CDP message must be a JSON object"}}
 )
 
 
@@ -166,12 +171,12 @@ async def admit(client_ws: WebSocket, services: Services, token: str | None = No
     )
 
 
-@dataclass
+@dataclass(kw_only=True)
 class _Session:
     """Per-session components shared by the two message pumps."""
 
     client_ws: WebSocket
-    browser_ws: ClientConnection
+    agent_channel: CdpChannel  # the agent's channel to the browser
     governor: ActionGovernor
     targets: TargetRegistry
     reporter: ViolationReporter
@@ -182,13 +187,15 @@ class _Session:
     requests: GovernedRequests
     contexts: StatelockContexts
     scrubber: SecretScrubber
+    scripts: AgentScripts
+    field_watcher: FieldMemoryWatcher
+    replayer: ScriptClickReplayer
 
     async def respond(self, request: dict[str, Any], body: dict[str, Any]) -> None:
         """Answer an agent command in-band (only commands with an id get an answer).
         Secrets the session injected never reach the agent."""
         if isinstance(request.get("id"), int) and not self.reporter.client_closed:
-            text = json.dumps(cdp_response(request, body))
-            await self.client_ws.send_text(self.scrubber.text(text) if self.scrubber else text)
+            await self.client_ws.send_text(self.scrubber.text(json.dumps(cdp_response(request, body))))
 
 
 class LocalCommands:
@@ -246,9 +253,14 @@ class CdpBridge:
             admission.agent_id,
             admission.tenant_id,
         )
-        settings = self.services.settings
+        # Values of the secrets this session injects: removed from everything the agent
+        # receives and from the evidence.
         reporter = ViolationReporter(
-            client_ws, self.services.registry, self.services.events, close_delay=settings.violation_close_delay
+            client_ws,
+            self.services.registry,
+            self.services.events,
+            close_delay=self.services.settings.violation_close_delay,
+            scrubber=SecretScrubber(),
         )
         failed = False
         try:
@@ -256,10 +268,10 @@ class CdpBridge:
             # stop before the governor they call, and Chromium is always closed last.
             async with contextlib.AsyncExitStack() as stack:
                 await self._run_session(stack, client_ws, admission, reporter)
-        except Exception:  # logged once here; the agent sees close code 1011
+        except Exception:  # logged once here; the agent sees CLOSE_CODE_INTERNAL_ERROR
             failed = True
             logger.exception("Statelock session %s failed", admission.session_id)
-            await reporter.close(1011, "Statelock session failed (see the proxy log)")
+            await reporter.close(CLOSE_CODE_INTERNAL_ERROR, "Statelock session failed (see the proxy log)")
         finally:
             self.services.active_sessions.discard(admission.session_id)
             logger.info("Closed Statelock session %s", admission.session_id)
@@ -281,30 +293,56 @@ class CdpBridge:
         admission: Admission,
         reporter: ViolationReporter,
     ) -> None:
-        settings = self.services.settings
         browser = await self.services.launcher.launch()
         stack.push_async_callback(browser.close)
-        connection = CdpConnection(browser.cdp_ws_url, command_timeout=settings.guard_command_timeout)
-        await connection.open()
-        stack.push_async_callback(connection.close)
-        # The agent's own connection to the browser; nothing flows on it until the pumps start.
-        browser_ws = await stack.enter_async_context(websockets.connect(browser.cdp_ws_url, max_size=None))
+        pages = PageSessions(browser.connection)
+        await self._restore_saved_session(stack, browser.connection, pages, admission, reporter)
+        session = await self._build_session(stack, browser, pages, client_ws, admission=admission, reporter=reporter)
+        await self._run_pumps(session)
 
-        pages = PageSessions(connection)
+    async def _restore_saved_session(
+        self,
+        stack: contextlib.AsyncExitStack,
+        connection: CdpConnection,
+        pages: PageSessions,
+        admission: Admission,
+        reporter: ViolationReporter,
+    ) -> None:
+        """Restore the saved browser session the agent asked for; save it again at a clean end."""
         saved_session_key = self._saved_session_key(admission)
-        if saved_session_key is not None:
-            try:
-                await self.services.saved_sessions.restore(connection, saved_session_key)
-            except (SavedSessionError, CdpError):
-                logger.exception(
-                    "Could not restore saved browser session %s for session %s",
-                    saved_session_key.name,
-                    admission.session_id,
-                )
-                raise
-            if admission.save_session:
-                stack.push_async_exit(self._saver(connection, pages, saved_session_key, reporter))
-        fields = self.services.evaluator.field_specs(admission.agent_id)
+        if saved_session_key is None:
+            return
+        try:
+            await self.services.saved_sessions.restore(connection, saved_session_key)
+        except (SavedSessionError, CdpError):
+            logger.exception(
+                "Could not restore saved browser session %s for session %s",
+                saved_session_key.name,
+                admission.session_id,
+            )
+            raise
+        if admission.save_session:
+            stack.push_async_exit(self._saver(connection, pages, saved_session_key, reporter))
+
+    async def _build_session(
+        self,
+        stack: contextlib.AsyncExitStack,
+        browser: GovernedBrowser,
+        pages: PageSessions,
+        client_ws: WebSocket,
+        *,
+        admission: Admission,
+        reporter: ViolationReporter,
+    ) -> _Session:
+        """Create the session's components and wire them, before any message flows.
+        Each one's cleanup goes on ``stack``."""
+        settings = self.services.settings
+        evaluator = self.services.evaluator
+        connection = browser.connection
+        # The agent's own channel to the browser; nothing flows on it until the pumps start.
+        agent_channel = browser.multiplexer.agent
+        fields = evaluator.field_specs(admission.agent_id)
+        memory = SessionMemory(fields)
         inspector = Inspector(pages, timeout=settings.capture_timeout, fields=fields)
         targets = TargetRegistry(ready_timeout=settings.guard_ready_timeout)
         governor = ActionGovernor(
@@ -312,73 +350,77 @@ class CdpBridge:
             agent_id=admission.agent_id,
             tenant_id=admission.tenant_id,
             settings=settings,
-            evaluator=self.services.evaluator,
+            evaluator=evaluator,
             sink=self.services.sink,
             events=self.services.events,
             inspector=inspector,
             targets=targets,
             reporter=reporter,
             reviews=self.services.reviews,
-            browser_ws=browser_ws,
+            agent_channel=agent_channel,
             client_ws=client_ws,
-            memory=SessionMemory(fields),
+            scrubber=reporter.scrubber,
+            memory=memory,
             secrets=self.services.secrets,
         )
-        stack.push_async_callback(governor.close)
+        field_watcher = FieldMemoryWatcher(admission.session_id, memory, inspector, settings.memory_settle)
+        stack.push_async_callback(field_watcher.close)
+        # Agent code running per tab: tells the page guard which script clicks are the agent's.
+        scripts = AgentScripts(grace=settings.agent_script_grace)
+        replayer = ScriptClickReplayer(governor, pages, scripts)
         uploads = SessionUploads(settings.upload_dir, settings.upload_max_file_bytes, settings.upload_max_session_bytes)
         stack.callback(uploads.close)
         downloads = SessionDownloads(
             send=connection.send,
-            policy=governor,
+            policy=SessionDownloadPolicy(governor, inspector, evaluator),
             base_dir=settings.download_dir,
             max_file_bytes=settings.download_max_file_bytes,
             max_session_bytes=settings.download_max_session_bytes,
         )
         stack.push_async_callback(downloads.close)
-        guard = self._build_guard(pages, governor, admission.agent_id)
+        guard = self._build_guard(pages, governor, replayer, scripts, admission.agent_id)
         if guard is not None:
             stack.push_async_callback(guard.close)
         stack.push_async_callback(targets.close)
 
-        # Wiring, before any message flows.
-        connection.add_listener(governor.field_watcher.on_browser_event)
+        connection.add_listener(field_watcher.on_browser_event)
         connection.add_listener(downloads.on_event)
-        targets.add_setup(governor.field_watcher.setup_target)
+        targets.add_setup(field_watcher.setup_target)
         targets.add_setup(lambda _target_id, info: downloads.context_ready(as_str(info.get("browserContextId"))))
         if guard is not None:
             targets.add_setup(guard.setup_target)
         contexts = StatelockContexts(pages)
         await downloads.start()
 
-        commands = LocalCommands(
-            uploads, downloads, {"session_id": admission.session_id, "agent_id": admission.agent_id}
-        )
-        cookies = CookieReads(pages, targets, self.services.evaluator.cookie_access(admission.agent_id))
         requests = GovernedRequests(
             pages,
             targets,
-            self.services.evaluator.request_access(admission.agent_id),
+            evaluator.request_access(admission.agent_id),
             agent_id=admission.agent_id,
             secrets=self.services.secrets,
-            scrubber=governor.scrubber,
+            scrubber=reporter.scrubber,
+            max_concurrent=settings.max_concurrent_requests,
         )
         # Pushed last, so in-flight requests stop first, before the governor that records them.
         stack.push_async_callback(requests.close)
-        await self._run_pumps(
-            _Session(
-                client_ws,
-                browser_ws,
-                governor,
-                targets,
-                reporter,
-                guard,
-                uploads,
-                commands,
-                cookies,
-                requests,
-                contexts,
-                governor.scrubber,
-            )
+        return _Session(
+            client_ws=client_ws,
+            agent_channel=agent_channel,
+            governor=governor,
+            targets=targets,
+            reporter=reporter,
+            guard=guard,
+            uploads=uploads,
+            commands=LocalCommands(
+                uploads, downloads, {"session_id": admission.session_id, "agent_id": admission.agent_id}
+            ),
+            cookies=CookieReads(pages, targets, evaluator.cookie_access(admission.agent_id)),
+            requests=requests,
+            contexts=contexts,
+            scrubber=reporter.scrubber,
+            scripts=scripts,
+            field_watcher=field_watcher,
+            replayer=replayer,
         )
 
     def _saved_session_key(self, admission: Admission) -> SavedSessionKey | None:
@@ -404,7 +446,14 @@ class CdpBridge:
 
         return save
 
-    def _build_guard(self, pages: PageSessions, governor: ActionGovernor, agent_id: str) -> PageGuard | None:
+    def _build_guard(
+        self,
+        pages: PageSessions,
+        governor: ActionGovernor,
+        replayer: ScriptClickReplayer,
+        scripts: AgentScripts,
+        agent_id: str,
+    ) -> PageGuard | None:
         patterns = self.services.evaluator.guard_url_patterns(agent_id)
         if patterns is not None and not patterns:
             return None  # every policy for this agent allows synthetic events
@@ -419,8 +468,8 @@ class CdpBridge:
                 trusted_submit_window=settings.trusted_submit_window,
                 agent_navigation_window=settings.agent_navigation_window,
             ),
-            on_script_click=governor.replay_script_click if settings.replay_script_clicks else None,
-            agent_script_active=governor.scripts.active,
+            on_script_click=replayer.replay if settings.replay_script_clicks else None,
+            agent_script_active=scripts.active,
         )
 
     async def _run_pumps(self, session: _Session) -> None:
@@ -436,17 +485,11 @@ class CdpBridge:
             task.result()
 
     async def _client_to_browser(self, session: _Session) -> None:
-        try:
+        with _pump_end(session):
             while True:
                 raw_message = await session.client_ws.receive_text()
                 if not await self._handle_client_message(session, raw_message):
                     return
-        except WebSocketDisconnect:
-            logger.info("Client disconnected from Statelock session %s", session.governor.session_id)
-        except RuntimeError:
-            if not session.reporter.client_closed:
-                raise
-            logger.info("Client websocket closed for Statelock session %s", session.governor.session_id)
 
     async def _handle_client_message(self, session: _Session, raw_message: str) -> bool:
         """Route one agent command. Returns False when the session ends."""
@@ -466,7 +509,7 @@ class CdpBridge:
     async def _route_command(self, session: _Session, payload: dict[str, Any]) -> bool:
         """Govern an input action or forward a command. Returns False when the session ends."""
         # A script click the agent's code just made is replayed first, so this command sees its effect.
-        await session.governor.replays_done(self.services.settings.replay_wait)
+        await session.replayer.done(self.services.settings.replay_wait)
         if not await self._preflight(session, payload):
             return False
         if payload.get("method") in COOKIE_METHODS:
@@ -479,8 +522,7 @@ class CdpBridge:
             await session.respond(payload, body)
             return True
         if payload.get("method") == REQUEST_COMMAND:
-            # Beside the agent's other commands: a request can take up to 30 s.
-            session.requests.tasks.spawn(self._answer_request(session, payload))
+            await self._start_request(session, payload)
             return True
         action = classify_cdp_action(payload)
         if action is not None and action.method == FILE_UPLOAD_METHOD:
@@ -488,14 +530,26 @@ class CdpBridge:
             if action is None:
                 return False
         if action is not None:
-            session.governor.scripts.input_dispatched(session.targets.target_for(action.session_id))
+            session.scripts.input_dispatched(session.targets.target_for(action.session_id))
             return await session.governor.govern_input(action, payload)
         await self._prepare_command(session, payload)
-        await session.browser_ws.send(json.dumps(payload))
+        session.agent_channel.send(json.dumps(payload))
         return True
 
-    async def _answer_request(self, session: _Session, payload: dict[str, Any]) -> None:
-        outcome = await session.requests.answer(payload)
+    async def _start_request(self, session: _Session, payload: dict[str, Any]) -> None:
+        busy = session.requests.busy(payload)
+        if busy is not None:
+            # Declined here, in the agent's command stream: a flood of requests waits on it.
+            await session.governor.record_command({**payload, "params": busy.recorded}, busy.verdict)
+            await session.respond(payload, busy.body)
+            return
+
+        async def answer(outcome: FetchOutcome) -> None:
+            await self._answer_request(session, payload, outcome)
+
+        session.requests.start(payload, answer)
+
+    async def _answer_request(self, session: _Session, payload: dict[str, Any], outcome: FetchOutcome) -> None:
         recorded = {**payload, "params": outcome.recorded}
         if outcome.ends_session:
             # A background task: it answers and closes, but never reads the agent's socket.
@@ -509,10 +563,10 @@ class CdpBridge:
         target_id = session.targets.target_for(as_str(payload.get("sessionId")))
         if payload.get("method") in AGENT_NAVIGATION_METHODS:
             # Remember values on the page the agent is about to leave.
-            await session.governor.field_watcher.remember_page(target_id, "before_navigation")
+            await session.field_watcher.remember_page(target_id, "before_navigation")
         if session.guard is not None:
             session.guard.note_command(payload, target_id)
-        session.governor.scripts.started(payload, target_id)
+        session.scripts.started(payload, target_id)
         tag_agent_code(payload)
 
     async def _with_uploaded_files(
@@ -559,30 +613,31 @@ class CdpBridge:
         return True
 
     async def _browser_to_client(self, session: _Session) -> None:
-        try:
+        with _pump_end(session):
             while True:
-                raw_message = await session.browser_ws.recv()
+                raw_message = await session.agent_channel.recv()
                 if session.reporter.client_closed:
                     return
                 session.targets.track(raw_message)
                 session.contexts.observe(raw_message)
-                session.governor.scripts.observe(raw_message)
+                session.scripts.observe(raw_message)
                 if session.governor.claim_held_response(raw_message):
                     continue
-                scrubber = session.governor.scrubber
-                if isinstance(raw_message, bytes):
-                    raw_message = filter_network_message(raw_message.decode("utf-8", "replace")).encode("utf-8")
-                    if scrubber:
-                        raw_message = scrubber.text(raw_message.decode("utf-8", "replace")).encode("utf-8")
-                    await session.client_ws.send_bytes(raw_message)
-                else:
-                    # An injected secret never reaches the agent (e.g. reading the field's value back).
-                    raw_message = filter_network_message(raw_message)
-                    await session.client_ws.send_text(scrubber.text(raw_message) if scrubber else raw_message)
-        except WebSocketDisconnect:
-            logger.info("Client disconnected from Statelock session %s", session.governor.session_id)
-        except websockets.ConnectionClosed:
-            logger.info("Browser CDP connection closed for session %s", session.governor.session_id)
-        except RuntimeError:
-            if not session.reporter.client_closed:
-                raise
+                # An injected secret never reaches the agent (e.g. reading the field's value back).
+                await session.client_ws.send_text(session.scrubber.text(filter_network_message(raw_message)))
+
+
+@contextlib.contextmanager
+def _pump_end(session: _Session) -> Iterator[None]:
+    """How a message pump ends: the agent or the browser went away (logged), or an error."""
+    try:
+        yield
+    except WebSocketDisconnect:
+        logger.info("Client disconnected from Statelock session %s", session.governor.session_id)
+    except BrowserClosedError:
+        logger.info("Browser CDP connection closed for session %s", session.governor.session_id)
+    except RuntimeError:
+        # Starlette's error for a socket used after it closed; anything else is a failure.
+        if not session.reporter.client_closed:
+            raise
+        logger.info("Client websocket closed for Statelock session %s", session.governor.session_id)

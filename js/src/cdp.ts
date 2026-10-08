@@ -11,12 +11,21 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
 
+import { mimeType } from "./mime.js";
 import { StatelockPolicyViolationError } from "./violations.js";
 
 /** Per CDP message; stays well under the proxy's 16 MiB WebSocket message limit. */
-export const CHUNK_BYTES = 4 * 1024 * 1024;
-export const SESSION_COMMAND = "Statelock.session";
+const CHUNK_BYTES = 4 * 1024 * 1024;
+// Statelock's own CDP commands (the same names as statelock.wire in the Python package).
+const SESSION_COMMAND = "Statelock.session";
+const UPLOAD_BEGIN_COMMAND = "Statelock.uploadFileBegin";
+const UPLOAD_CHUNK_COMMAND = "Statelock.uploadFileChunk";
+const UPLOAD_END_COMMAND = "Statelock.uploadFileEnd";
+const DOWNLOADS_COMMAND = "Statelock.downloads";
+const DOWNLOAD_READ_COMMAND = "Statelock.downloadRead";
+const REQUEST_COMMAND = "Statelock.fetch";
 const DOWNLOAD_POLL_MS = 100;
+export const DEFAULT_DOWNLOAD_TIMEOUT_MS = 30_000;
 /** Chromium's answer to a method it does not have ("'Statelock.session' wasn't found"). */
 const UNKNOWN_COMMAND_TEXT = "wasn't found";
 
@@ -33,8 +42,8 @@ export function cdpSender(target: CdpSender | { sendCDP(method: string, params?:
   return target as CdpSender;
 }
 
-/** A file to upload: a path, or Playwright's FilePayload shape. */
-export type UploadFile = string | { name: string; mimeType?: string; buffer: Uint8Array | string };
+/** A file to upload: a path, or Playwright's FilePayload shape (buffer: bytes, or text as UTF-8). */
+export type UploadFile = string | { name: string; mimeType?: string; buffer: ArrayBufferView | ArrayBuffer | string };
 
 export interface UploadedFile {
   path: string; // on the proxy; only DOM.setFileInputFiles on the same session may use it
@@ -42,6 +51,12 @@ export interface UploadedFile {
   size: number;
   sha256: string;
   mimeType: string | null;
+}
+
+/** What Statelock.session answers for a browser behind Statelock. */
+export interface StatelockSessionInfo {
+  session_id: string;
+  agent_id: string;
 }
 
 async function send(cdp: CdpSender, method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
@@ -54,7 +69,7 @@ async function send(cdp: CdpSender, method: string, params: Record<string, unkno
  * browser (it does not know the command). Any other error (a closed page, a lost
  * connection) says nothing about the browser and is thrown.
  */
-export async function statelockSession(cdp: CdpSender): Promise<{ session_id: string; agent_id: string } | null> {
+export async function sessionInfo(cdp: CdpSender): Promise<StatelockSessionInfo | null> {
   let result: Record<string, unknown>;
   try {
     result = await send(cdp, SESSION_COMMAND);
@@ -63,43 +78,42 @@ export async function statelockSession(cdp: CdpSender): Promise<{ session_id: st
     throw error;
   }
   if (typeof result.session_id !== "string") throw new Error(`unexpected ${SESSION_COMMAND} answer`);
-  return result as { session_id: string; agent_id: string };
+  return result as unknown as StatelockSessionInfo;
 }
-
-const MIME_TYPES: Record<string, string> = {
-  ".pdf": "application/pdf",
-  ".txt": "text/plain",
-  ".csv": "text/csv",
-  ".json": "application/json",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-};
 
 async function payload(item: UploadFile): Promise<{ name: string; mimeType: string | null; data: Buffer }> {
   if (typeof item === "string") {
     const name = basename(item);
-    const extension = name.includes(".") ? name.slice(name.lastIndexOf(".")).toLowerCase() : "";
-    return { name, mimeType: MIME_TYPES[extension] ?? null, data: await readFile(item) };
+    return { name, mimeType: mimeType(name), data: await readFile(item) };
   }
-  const data = typeof item.buffer === "string" ? Buffer.from(item.buffer, "utf8") : Buffer.from(item.buffer);
-  return { name: item.name, mimeType: item.mimeType ?? null, data };
+  return { name: item.name, mimeType: item.mimeType ?? null, data: bufferBytes(item.buffer) };
+}
+
+/**
+ * A FilePayload's buffer as bytes. Views are taken byte for byte (Buffer.from on a
+ * Uint16Array would truncate each element); anything else, or no buffer, is refused
+ * rather than uploaded as its text or as an empty file.
+ */
+function bufferBytes(buffer: unknown): Buffer {
+  if (typeof buffer === "string") return Buffer.from(buffer, "utf8");
+  if (ArrayBuffer.isView(buffer)) return Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  if (buffer instanceof ArrayBuffer) return Buffer.from(buffer);
+  const kind = buffer === null ? "null" : typeof buffer === "object" ? (buffer.constructor?.name ?? "object") : typeof buffer;
+  throw new TypeError(`setInputFiles: buffer must be a Buffer, TypedArray, DataView, ArrayBuffer or string, not ${kind}`);
 }
 
 /** Stream files to Statelock over the session. Returns the proxy-side files (name, size, SHA-256). */
 export async function uploadFiles(cdp: CdpSender, files: UploadFile | UploadFile[]): Promise<UploadedFile[]> {
   const uploaded: UploadedFile[] = [];
   for (const item of Array.isArray(files) ? files : [files]) {
-    const { name, mimeType, data } = await payload(item);
-    const begun = await send(cdp, "Statelock.uploadFileBegin", { name, mimeType });
+    const { name, mimeType: type, data } = await payload(item);
+    const begun = await send(cdp, UPLOAD_BEGIN_COMMAND, { name, mimeType: type });
     const uploadId = begun.uploadId;
     for (let offset = 0; offset < data.length; offset += CHUNK_BYTES) {
       const chunk = data.subarray(offset, offset + CHUNK_BYTES).toString("base64");
-      await send(cdp, "Statelock.uploadFileChunk", { uploadId, data: chunk });
+      await send(cdp, UPLOAD_CHUNK_COMMAND, { uploadId, data: chunk });
     }
-    uploaded.push((await send(cdp, "Statelock.uploadFileEnd", { uploadId })) as unknown as UploadedFile);
+    uploaded.push((await send(cdp, UPLOAD_END_COMMAND, { uploadId })) as unknown as UploadedFile);
   }
   return uploaded;
 }
@@ -130,8 +144,8 @@ export interface DownloadInfo {
   sha256: string;
 }
 
-export async function listDownloads(cdp: CdpSender): Promise<Record<string, unknown>[]> {
-  const result = await send(cdp, "Statelock.downloads");
+async function listDownloads(cdp: CdpSender): Promise<Record<string, unknown>[]> {
+  const result = await send(cdp, DOWNLOADS_COMMAND);
   const downloads = result.downloads;
   return Array.isArray(downloads) ? downloads.filter((d) => d && typeof d === "object") : [];
 }
@@ -143,10 +157,16 @@ export async function knownDownloads(cdp: CdpSender): Promise<Set<string>> {
 
 /**
  * Wait until a download not in `known` completes and passes Statelock's checks.
- * A download Statelock blocked throws StatelockPolicyViolationError (the session ends).
+ * `timeoutMs` 0 waits without a limit, as in Playwright. A download Statelock blocked
+ * throws StatelockPolicyViolationError with the rule it reports (the session ends;
+ * guard() completes it with the recorded violation).
  */
-export async function waitForDownload(cdp: CdpSender, known: Set<string>, timeoutMs = 30_000): Promise<DownloadInfo> {
-  const deadline = Date.now() + timeoutMs;
+export async function waitForDownload(
+  cdp: CdpSender,
+  known: Set<string>,
+  timeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS,
+): Promise<DownloadInfo> {
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : Infinity;
   while (Date.now() < deadline) {
     for (const item of await listDownloads(cdp)) {
       if (known.has(String(item.guid))) continue;
@@ -160,9 +180,8 @@ export async function waitForDownload(cdp: CdpSender, known: Set<string>, timeou
         };
       }
       if (item.state === "blocked") {
-        // guard() completes it with the violation Statelock recorded.
         throw new StatelockPolicyViolationError({
-          rule: "download",
+          rule: typeof item.rule === "string" ? item.rule : null,
           reason: typeof item.reason === "string" ? item.reason : `Statelock blocked ${String(item.name)}`,
         });
       }
@@ -173,22 +192,33 @@ export async function waitForDownload(cdp: CdpSender, known: Set<string>, timeou
   throw new StatelockDownloadError(`no download completed within ${timeoutMs} ms`);
 }
 
-/** Read a checked download's bytes from the proxy, verifying its SHA-256. */
-export async function readDownload(cdp: CdpSender, download: DownloadInfo): Promise<Buffer> {
-  const chunks: Buffer[] = [];
+/** Stream a checked download from the proxy in chunks, verifying its SHA-256 at the end. */
+export async function streamDownload(
+  cdp: CdpSender,
+  download: DownloadInfo,
+  write: (chunk: Buffer) => Promise<void>,
+): Promise<void> {
   const digest = createHash("sha256");
   let offset = 0;
   for (;;) {
-    const result = await send(cdp, "Statelock.downloadRead", { guid: download.guid, offset, length: CHUNK_BYTES });
+    const result = await send(cdp, DOWNLOAD_READ_COMMAND, { guid: download.guid, offset, length: CHUNK_BYTES });
     const chunk = Buffer.from(String(result.data ?? ""), "base64");
     digest.update(chunk);
-    chunks.push(chunk);
+    await write(chunk);
     offset += chunk.length;
     if (result.eof || chunk.length === 0) break;
   }
   if (digest.digest("hex") !== download.sha256) {
     throw new StatelockDownloadError(`${download.name}: content does not match the recorded SHA-256`);
   }
+}
+
+/** Read a checked download's bytes from the proxy, verifying its SHA-256. */
+export async function readDownload(cdp: CdpSender, download: DownloadInfo): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  await streamDownload(cdp, download, async (chunk) => {
+    chunks.push(chunk);
+  });
   return Buffer.concat(chunks);
 }
 
@@ -199,15 +229,61 @@ export interface FetchOptions {
   data?: Uint8Array | string | Record<string, unknown> | unknown[];
 }
 
-export interface StatelockResponse {
-  status: number;
-  statusText: string;
-  url: string;
-  ok: boolean;
-  headers: Record<string, string>;
-  body: Buffer;
-  text(): string;
-  json(): unknown;
+/** The response of a governed request, with Playwright's APIResponse API. */
+export class StatelockResponse {
+  readonly #status: number;
+  readonly #statusText: string;
+  readonly #url: string;
+  readonly #headers: [string, string][];
+  readonly #body: Buffer;
+
+  constructor(result: Record<string, unknown>) {
+    this.#status = Number(result.status ?? 0);
+    this.#statusText = String(result.statusText ?? "");
+    this.#url = String(result.url ?? "");
+    const pairs = Array.isArray(result.headers) ? (result.headers as unknown[]) : [];
+    this.#headers = pairs.filter(Array.isArray).map(([name, value]) => [String(name), String(value)]);
+    this.#body = Buffer.from(String(result.body ?? ""), "base64");
+  }
+
+  status(): number {
+    return this.#status;
+  }
+
+  statusText(): string {
+    return this.#statusText;
+  }
+
+  url(): string {
+    return this.#url;
+  }
+
+  ok(): boolean {
+    return this.#status >= 200 && this.#status <= 299;
+  }
+
+  /** Header names in lower case (the last value of a repeated header, as in the Python SDK). */
+  headers(): Record<string, string> {
+    return Object.fromEntries(this.#headers.map(([name, value]) => [name.toLowerCase(), value]));
+  }
+
+  headersArray(): { name: string; value: string }[] {
+    return this.#headers.map(([name, value]) => ({ name, value }));
+  }
+
+  async body(): Promise<Buffer> {
+    return this.#body;
+  }
+
+  async text(): Promise<string> {
+    return this.#body.toString("utf8");
+  }
+
+  async json(): Promise<unknown> {
+    return JSON.parse(this.#body.toString("utf8"));
+  }
+
+  async dispose(): Promise<void> {}
 }
 
 /**
@@ -225,23 +301,11 @@ export async function statelockFetch(cdp: CdpSender, url: string, options: Fetch
     body = Buffer.from(JSON.stringify(data), "utf8");
     if (!Object.keys(headers).some((h) => h.toLowerCase() === "content-type")) headers["Content-Type"] = "application/json";
   }
-  const result = await send(cdp, "Statelock.fetch", {
+  const result = await send(cdp, REQUEST_COMMAND, {
     url,
     method: (options.method ?? "GET").toUpperCase(),
     headers,
     body: body ? body.toString("base64") : null,
   });
-  const responseBody = Buffer.from(String(result.body ?? ""), "base64");
-  const pairs = Array.isArray(result.headers) ? (result.headers as [string, string][]) : [];
-  const status = Number(result.status ?? 0);
-  return {
-    status,
-    statusText: String(result.statusText ?? ""),
-    url: String(result.url ?? ""),
-    ok: status >= 200 && status <= 299,
-    headers: Object.fromEntries(pairs.map(([k, v]) => [k.toLowerCase(), v])),
-    body: responseBody,
-    text: () => responseBody.toString("utf8"),
-    json: () => JSON.parse(responseBody.toString("utf8")),
-  };
+  return new StatelockResponse(result);
 }

@@ -33,14 +33,15 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urldefrag
 
 from statelock.core.enums import InitiatedBy, SystemRule
-from statelock.core.jsonutil import as_dict, as_str
+from statelock.core.jsonutil import as_dict, as_int, as_str
 from statelock.core.urls import origin_and_path, url_in_scope
 from statelock.proxy.attribution import AGENT_SOURCE_URL, REQUEST_SOURCE_URL, frames_tainted, stack_frames
 from statelock.proxy.commands import AGENT_NAVIGATION_METHODS
 from statelock.proxy.connection import CdpError
-from statelock.proxy.js import load_js
+from statelock.proxy.js import MAX_FRAME_DEPTH, load_js
 from statelock.proxy.pages import PageSessions
 from statelock.proxy.tasks import BackgroundTasks
 from statelock.proxy.worlds import GUARD_BINDING, GUARD_WORLD
@@ -51,41 +52,14 @@ REPLAY_ELEMENT_FUNCTION = "__statelockReplayElement"
 GUARDED_EVENT_TYPES = ("click", "dblclick", "auxclick", "submit", "drop", "paste")
 # Violation kinds guard.js may report; anything else is recorded as a synthetic event.
 GUARD_SCRIPT_VIOLATIONS = {SystemRule.SYNTHETIC_EVENT.value, SystemRule.UNTRUSTED_FILE_INPUT.value}
+DOCUMENT = "Document"  # the resource type of a page load
 # Chromium rejects EventSource as a Fetch interception type.
-INTERCEPTED_RESOURCE_TYPES = ("Document", "XHR", "Fetch", "Ping")
+INTERCEPTED_RESOURCE_TYPES = (DOCUMENT, "XHR", "Fetch", "Ping")
 ASYNC_STACK_DEPTH = 32
 GUARDED_TARGET_TYPES = {"page", "iframe"}
 ATTRIBUTION_FRAMES_RECORDED = 8  # initiator stack frames kept in network.jsonl
 CLOSE_DRAIN_TIMEOUT = 5.0  # seconds for in-flight violation handlers to finish recording
 FORM_SUBMISSION_REASONS = {"formSubmissionGet", "formSubmissionPost"}
-
-# Where a real click on a replayed element lands: its center, once the layout has
-# stopped moving (a scroll or a viewport resize can still be settling), when the
-# element itself is there (not covered, not zero-sized); else null.
-REPLAY_POINT_FUNCTION = """async function () {
-  const frame = () => new Promise((resolve) => { requestAnimationFrame(() => resolve()); setTimeout(resolve, 100); });
-  const center = () => {
-    if (!this.isConnected) return null;
-    const rect = this.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return null;
-    return {x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};
-  };
-  let point = center();
-  for (let i = 0; point && i < 10; i++) {
-    await frame();
-    const next = center();
-    if (next && next.x === point.x && next.y === point.y) break;
-    point = next;
-  }
-  if (!point) return null;
-  const hit = document.elementFromPoint(point.x, point.y);
-  return hit && (hit === this || this.contains(hit)) ? point : null;
-}"""
-# Whether the element is still what a click at (x, y) hits.
-REPLAY_HITS_FUNCTION = """function (x, y) {
-  const hit = document.elementFromPoint(x, y);
-  return !!hit && (hit === this || this.contains(hit));
-}"""
 
 ViolationHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 
@@ -126,7 +100,7 @@ class ReplayTarget:
             "Runtime.callFunctionOn",
             {
                 "objectId": object_id,
-                "functionDeclaration": REPLAY_POINT_FUNCTION,
+                "functionDeclaration": load_js("replay_point.js"),
                 "awaitPromise": True,
                 "returnByValue": True,
             },
@@ -144,7 +118,7 @@ class ReplayTarget:
             "Runtime.callFunctionOn",
             {
                 "objectId": self._object_id,
-                "functionDeclaration": REPLAY_HITS_FUNCTION,
+                "functionDeclaration": load_js("replay_hits.js"),
                 "arguments": [{"value": point["x"]}, {"value": point["y"]}],
                 "returnByValue": True,
             },
@@ -188,6 +162,18 @@ class GuardTimings:
     attribution_timeout: float = 1.0
     trusted_submit_window: float = 3.0
     agent_navigation_window: float = 10.0
+    # A reload or history navigation whose URL could not be looked up labels the next
+    # page load within this window only.
+    unknown_navigation_window: float = 1.0
+
+
+@dataclass
+class AgentNavigation:
+    """An agent navigation command (goto, reload, back/forward), for attribution."""
+
+    url: str | None  # the URL it loads (a reload or history entry's URL is looked up)
+    at: float  # monotonic time of the command
+    lookup: asyncio.Task[None] | None = None
 
 
 @dataclass
@@ -201,8 +187,10 @@ class TargetGuardState:
     attribution_waiters: dict[str, asyncio.Future[dict[str, Any]]] = field(default_factory=dict)
     trusted_submit_at: float | None = None
     untrusted_form_urls: set[str] = field(default_factory=set)
-    # (url or None for reload/history, monotonic time) of agent navigation commands.
-    agent_navigations: list[tuple[str | None, float]] = field(default_factory=list)
+    agent_navigations: list[AgentNavigation] = field(default_factory=list)
+    installed: bool = False
+    # For a frame target (an out-of-process iframe): the frame it is in.
+    parent_frame_id: str | None = None
 
 
 class PageGuard:
@@ -231,16 +219,17 @@ class PageGuard:
         self._handlers: dict[str, Callable[[str, TargetGuardState, dict[str, Any]], None]] = {
             "Runtime.bindingCalled": self._on_binding_called,
             "Fetch.requestPaused": self._on_request_paused,
-            "Debugger.scriptParsed": lambda _sid, state, params: self.handle_script_parsed(state, params),
-            "Network.requestWillBeSent": lambda _sid, state, params: self.handle_request_will_be_sent(state, params),
-            "Network.loadingFinished": lambda _sid, state, params: self.forget_request(state, params),
-            "Network.loadingFailed": lambda _sid, state, params: self.forget_request(state, params),
-            "Page.frameNavigated": lambda _sid, state, params: self.handle_frame_navigated(state, params),
-            "Page.frameRequestedNavigation": lambda _sid, state, params: self.handle_requested_navigation(
+            "Debugger.scriptParsed": lambda _sid, state, params: self._handle_script_parsed(state, params),
+            "Network.requestWillBeSent": lambda _sid, state, params: self._handle_request_will_be_sent(state, params),
+            "Network.loadingFinished": lambda _sid, state, params: self._forget_request(state, params),
+            "Network.loadingFailed": lambda _sid, state, params: self._forget_request(state, params),
+            "Page.frameNavigated": lambda _sid, state, params: self._handle_frame_navigated(state, params),
+            "Page.frameRequestedNavigation": lambda _sid, state, params: self._handle_requested_navigation(
                 state, params
             ),
         }
         pages.connection.add_listener(self._on_event)
+        pages.on_detached(lambda session_id: self._states.pop(session_id, None))
 
     async def close(self, drain_timeout: float = CLOSE_DRAIN_TIMEOUT) -> None:
         """Let in-flight violation handlers finish recording, then cancel the rest."""
@@ -250,18 +239,53 @@ class PageGuard:
         """TargetRegistry setup step: install the guard on pages and iframes."""
         if target_info.get("type") not in GUARDED_TARGET_TYPES:
             return None
-        return self.install(target_id)
+        return self.install(
+            target_id,
+            paused=target_info.get("waitingForDebugger") is True,
+            parent_frame_id=as_str(target_info.get("parentFrameId")),
+        )
 
     def is_governed(self, *urls: str) -> bool:
         if self.url_patterns is None:
             return True
         return any(url_in_scope(pattern, url) for url in urls if url for pattern in self.url_patterns)
 
-    async def install(self, target_id: str) -> None:
-        """Configure the guard on a target. Raises CdpError on failure."""
+    def _governed(self, state: TargetGuardState, *urls: str) -> bool:
+        """A request or submission on a target is governed when a URL is, or when the target
+        is a frame of a governed page (unknown parents count as governed: fail closed)."""
+        return self.is_governed(state.main_frame_url, *urls) or self._in_governed_page(state)
+
+    def _in_governed_page(self, state: TargetGuardState) -> bool:
+        for _depth in range(MAX_FRAME_DEPTH):  # frame targets followed up to the page they are in
+            if state.parent_frame_id is None:
+                return False
+            parent = next((s for s in self._states.values() if s.target_id == state.parent_frame_id), None)
+            if parent is None:
+                return True  # a frame inside another target's page that Statelock does not track
+            if self.is_governed(parent.main_frame_url):
+                return True
+            state = parent
+        return True
+
+    async def install(self, target_id: str, *, paused: bool = False, parent_frame_id: str | None = None) -> None:
+        """Configure the guard on a target. Raises CdpError on failure.
+
+        ``paused``: the target waits for the debugger before running any script (the
+        agent's auto-attach). Its first document gets the guard script then; running it
+        immediately would wait for the target to run, which waits for this setup.
+
+        Once per target: what the guard learned about it (scripts agent code created,
+        trusted submits, agent navigations) is kept when the agent attaches to it again.
+        """
         connection = self.pages.connection
         session_id = await self.pages.session_for(target_id)
-        self._states[session_id] = TargetGuardState(target_id=target_id, session_id=session_id)
+        state = self._states.get(session_id)
+        if state is not None and state.installed:
+            return
+        if state is None:
+            state = self._states[session_id] = TargetGuardState(
+                target_id=target_id, session_id=session_id, parent_frame_id=parent_frame_id
+            )
         await connection.send("Network.enable", session_id=session_id)
         await connection.send("Debugger.enable", session_id=session_id)
         await connection.send("Debugger.setAsyncCallStackDepth", {"maxDepth": ASYNC_STACK_DEPTH}, session_id=session_id)
@@ -271,14 +295,14 @@ class PageGuard:
             {"name": GUARD_BINDING, "executionContextName": GUARD_WORLD},
             session_id=session_id,
         )
-        script: dict[str, Any] = {
-            "source": guard_script(self.url_patterns),
-            "worldName": GUARD_WORLD,
-            "runImmediately": True,
-        }
+        script: dict[str, Any] = {"source": guard_script(self.url_patterns), "worldName": GUARD_WORLD}
+        if not paused:
+            script["runImmediately"] = True
         try:
             await connection.send("Page.addScriptToEvaluateOnNewDocument", script, session_id=session_id)
         except CdpError:
+            if paused:
+                raise
             # Chromium without runImmediately: applies from the next document.
             script.pop("runImmediately")
             await connection.send("Page.addScriptToEvaluateOnNewDocument", script, session_id=session_id)
@@ -292,6 +316,7 @@ class PageGuard:
             },
             session_id=session_id,
         )
+        state.installed = True
         logger.info("Installed Statelock page guard target=%s", target_id)
 
     def note_command(self, payload: dict[str, Any], target_id: str | None) -> None:
@@ -299,26 +324,53 @@ class PageGuard:
         method = payload.get("method")
         if method not in AGENT_NAVIGATION_METHODS or target_id is None:
             return
-        url = as_dict(payload.get("params")).get("url") if method == "Page.navigate" else None
-        self.note_agent_navigation(target_id, as_str(url))
+        params = as_dict(payload.get("params"))
+        if method == "Page.navigate":
+            self._note_agent_navigation(target_id, as_str(params.get("url")))
+            return
+        # A reload or history navigation names no URL: look it up in the tab's history.
+        for state, navigation in self._note_agent_navigation(target_id, None):
+            navigation.lookup = self._tasks.spawn(self._history_url(state, navigation, str(method), params))
 
-    def note_agent_navigation(self, target_id: str, url: str | None) -> None:
+    def _note_agent_navigation(self, target_id: str, url: str | None) -> list[tuple[TargetGuardState, AgentNavigation]]:
         """Record an agent navigation command (goto, reload, back/forward) for attribution."""
         now = time.monotonic()
         window = self.timings.agent_navigation_window
+        noted = []
         for state in self._states.values():
             if state.target_id == target_id:
-                state.agent_navigations = [e for e in state.agent_navigations if now - e[1] <= window]
-                state.agent_navigations.append((url, now))
+                state.agent_navigations = [n for n in state.agent_navigations if now - n.at <= window]
+                navigation = AgentNavigation(url, now)
+                state.agent_navigations.append(navigation)
+                noted.append((state, navigation))
+        return noted
+
+    async def _history_url(
+        self, state: TargetGuardState, navigation: AgentNavigation, method: str, params: dict[str, Any]
+    ) -> None:
+        """The URL a reload (the current history entry) or history navigation (its entry) loads."""
+        try:
+            history = await self.pages.connection.send("Page.getNavigationHistory", session_id=state.session_id)
+        except CdpError as error:
+            logger.debug("Navigation history unavailable for %s: %s", state.target_id, error)
+            return
+        entries = [as_dict(entry) for entry in history.get("entries") or []]
+        entry: dict[str, Any] | None = None
+        if method == "Page.reload":
+            index = history.get("currentIndex")
+            if isinstance(index, int) and 0 <= index < len(entries):
+                entry = entries[index]
+        else:
+            entry = next((e for e in entries if e.get("id") == params.get("entryId")), None)
+        url = as_str((entry or {}).get("url"))
+        if url:
+            navigation.url = urldefrag(url).url
 
     # Event handling -----------------------------------------------------------------
 
     def _on_event(self, message: dict[str, Any]) -> None:
         method = str(message.get("method") or "")
         params = as_dict(message.get("params"))
-        if method == "Target.detachedFromTarget":
-            self._states.pop(str(params.get("sessionId") or ""), None)
-            return
         session_id = as_str(message.get("sessionId"))
         state = self._states.get(session_id or "")
         handler = self._handlers.get(method)
@@ -328,18 +380,17 @@ class PageGuard:
 
     def _on_binding_called(self, _session_id: str, state: TargetGuardState, params: dict[str, Any]) -> None:
         if params.get("name") == GUARD_BINDING:
-            context_id = params.get("executionContextId")
-            self.handle_binding(state, params.get("payload"), context_id if isinstance(context_id, int) else None)
+            self._handle_binding(state, params.get("payload"), as_int(params.get("executionContextId")))
 
     def _on_request_paused(self, session_id: str, state: TargetGuardState, params: dict[str, Any]) -> None:
-        self._tasks.spawn(self.decide(session_id, state, params))
+        self._tasks.spawn(self._decide(session_id, state, params))
 
-    def handle_frame_navigated(self, state: TargetGuardState, params: dict[str, Any]) -> None:
+    def _handle_frame_navigated(self, state: TargetGuardState, params: dict[str, Any]) -> None:
         frame = as_dict(params.get("frame"))
         if frame and not frame.get("parentId"):
             state.main_frame_url = str(frame.get("url") or "")
 
-    def handle_binding(self, state: TargetGuardState, raw_payload: Any, context_id: int | None = None) -> None:
+    def _handle_binding(self, state: TargetGuardState, raw_payload: Any, context_id: int | None = None) -> None:
         """A report from guard.js (context_id: the guard world it came from)."""
         try:
             payload = json.loads(raw_payload or "{}")
@@ -361,17 +412,16 @@ class PageGuard:
 
     def _replay_id(self, state: TargetGuardState, payload: dict[str, Any]) -> int | None:
         """The id guard.js kept a plain click's element under, when agent code made the click."""
-        replay_id = payload.get("replay_id")
+        replay_id = as_int(payload.get("replay_id"))
         replayable = (
             payload.get("kind") == SystemRule.SYNTHETIC_EVENT.value
             and payload.get("event_type") == "click"
-            and isinstance(replay_id, int)
-            and not isinstance(replay_id, bool)
+            and replay_id is not None
             and self.agent_script_active(state.target_id)
         )
         return replay_id if replayable else None
 
-    def handle_script_parsed(self, state: TargetGuardState, params: dict[str, Any]) -> None:
+    def _handle_script_parsed(self, state: TargetGuardState, params: dict[str, Any]) -> None:
         script_id = params.get("scriptId")
         if not isinstance(script_id, str):
             return
@@ -380,7 +430,7 @@ class PageGuard:
         ):
             state.tainted_script_ids.add(script_id)
 
-    def handle_request_will_be_sent(self, state: TargetGuardState, params: dict[str, Any]) -> None:
+    def _handle_request_will_be_sent(self, state: TargetGuardState, params: dict[str, Any]) -> None:
         request_id = params.get("requestId")
         if not isinstance(request_id, str):
             return
@@ -410,13 +460,13 @@ class PageGuard:
         if waiter is not None and not waiter.done():
             waiter.set_result(attribution)
 
-    def forget_request(self, state: TargetGuardState, params: dict[str, Any]) -> None:
+    def _forget_request(self, state: TargetGuardState, params: dict[str, Any]) -> None:
         """A request finished: drop its attribution, so long-lived pages do not grow the map."""
         request_id = params.get("requestId")
         if isinstance(request_id, str):
             state.attributions.pop(request_id, None)
 
-    def handle_requested_navigation(self, state: TargetGuardState, params: dict[str, Any]) -> None:
+    def _handle_requested_navigation(self, state: TargetGuardState, params: dict[str, Any]) -> None:
         if params.get("reason") not in FORM_SUBMISSION_REASONS:
             return
         url = str(params.get("url") or "")
@@ -424,18 +474,29 @@ class PageGuard:
         if state.trusted_submit_at is not None and now - state.trusted_submit_at <= self.timings.trusted_submit_window:
             state.trusted_submit_at = None
             return
-        if self.is_governed(state.main_frame_url, url):
+        if self._governed(state, url):
             state.untrusted_form_urls.add(url)
 
-    def consume_agent_navigation(self, state: TargetGuardState, url: str) -> bool:
+    def _consume_agent_navigation(self, state: TargetGuardState, url: str) -> bool:
         now = time.monotonic()
-        for index, (expected_url, noted_at) in enumerate(state.agent_navigations):
-            if now - noted_at > self.timings.agent_navigation_window:
+        for index, navigation in enumerate(state.agent_navigations):
+            age = now - navigation.at
+            if age > self.timings.agent_navigation_window:
                 continue
-            if expected_url is None or expected_url == url or url.startswith(expected_url):
+            if navigation.url is None:
+                matched = age <= self.timings.unknown_navigation_window
+            else:
+                matched = navigation.url == url or url.startswith(navigation.url)
+            if matched:
                 del state.agent_navigations[index]
                 return True
         return False
+
+    async def _navigation_lookups(self, state: TargetGuardState) -> None:
+        """Wait (bounded) for the history URLs of pending reloads and history navigations."""
+        pending = {n.lookup for n in state.agent_navigations if n.lookup is not None and not n.lookup.done()}
+        if pending:
+            await asyncio.wait(pending, timeout=self.timings.attribution_timeout)
 
     async def _attribution(self, state: TargetGuardState, network_id: str | None) -> dict[str, Any] | None:
         if network_id is None:
@@ -453,7 +514,7 @@ class PageGuard:
             state.attribution_waiters.pop(network_id, None)
             return None
 
-    def classify(
+    def _classify(
         self,
         state: TargetGuardState,
         url: str,
@@ -461,18 +522,18 @@ class PageGuard:
         attribution: dict[str, Any] | None,
     ) -> tuple[str, str | None, bool]:
         """Return (initiated_by, violation kind or None, governed) for a paused request."""
-        governed = self.is_governed(state.main_frame_url, url)
-        untrusted_form = resource_type == "Document" and url in state.untrusted_form_urls
-        if resource_type == "Document":  # an XHR to the same URL must not clear the mark
+        governed = self._governed(state, url)
+        untrusted_form = resource_type == DOCUMENT and url in state.untrusted_form_urls
+        if resource_type == DOCUMENT:  # an XHR to the same URL must not clear the mark
             state.untrusted_form_urls.discard(url)
 
         initiated_by = attribution["initiated_by"] if attribution else InitiatedBy.UNKNOWN.value
         if untrusted_form:
             initiated_by = InitiatedBy.AGENT_CODE.value
         elif (
-            resource_type == "Document"
+            resource_type == DOCUMENT
             and initiated_by != InitiatedBy.AGENT_CODE.value
-            and self.consume_agent_navigation(state, url)
+            and self._consume_agent_navigation(state, url)
         ):
             initiated_by = InitiatedBy.AGENT_NAVIGATION.value
 
@@ -483,15 +544,17 @@ class PageGuard:
             kind = SystemRule.AGENT_CODE_REQUEST.value
         return initiated_by, kind, governed
 
-    async def decide(self, session_id: str, state: TargetGuardState, params: dict[str, Any]) -> None:
+    async def _decide(self, session_id: str, state: TargetGuardState, params: dict[str, Any]) -> None:
         """Release or fail one paused request."""
-        fetch_request_id = params.get("requestId")
+        fetch_request_id = str(params.get("requestId") or "")
         request = as_dict(params.get("request"))
         url = str(request.get("url") or "")
         resource_type = as_str(params.get("resourceType"))
         try:
             attribution = await self._attribution(state, as_str(params.get("networkId")))
-            initiated_by, kind, governed = self.classify(state, url, resource_type, attribution)
+            if resource_type == DOCUMENT:
+                await self._navigation_lookups(state)
+            initiated_by, kind, governed = self._classify(state, url, resource_type, attribution)
             record = {
                 "kind": kind or "request",
                 "target_id": state.target_id,
@@ -518,7 +581,7 @@ class PageGuard:
             with contextlib.suppress(CdpError):
                 await self._fail_request(session_id, fetch_request_id)
 
-    async def _fail_request(self, session_id: str, fetch_request_id: Any) -> None:
+    async def _fail_request(self, session_id: str, fetch_request_id: str) -> None:
         await self.pages.connection.send(
             "Fetch.failRequest",
             {"requestId": fetch_request_id, "errorReason": "BlockedByClient"},
@@ -561,7 +624,7 @@ def violation_reason(event: dict[str, Any]) -> str:
             f"Blocked files {event.get('files')} in file input {target.get('id') or target.get('tag_name')} "
             f"at {event.get('url')}: they were set by page code, not chosen through the file chooser or "
             "DOM.setFileInputFiles. Playwright set_input_files over a remote CDP connection sets files "
-            "with page code. Use StatelockConnection.set_input_files(page, selector, files) instead."
+            "with page code. Use statelock.client.install(), or governed.set_input_files(selector, files), instead."
         )
     target = as_dict(event.get("target"))
     target_text = str(target.get("text") or target.get("aria_label") or "").strip()[:80]

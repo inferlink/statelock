@@ -28,20 +28,26 @@ SERVER_ENV = "STATELOCK_URL"
 REQUEST_TIMEOUT = 10.0
 
 
-class SessionUrlError(Exception):
+class StatelockClientError(Exception):
     """Statelock refused or could not answer a request (session URLs, saved sessions,
-    violation lookups). ``status`` is the HTTP status when Statelock answered."""
+    violation lookups, guards). ``status`` is the HTTP status when Statelock answered."""
 
     def __init__(self, message: str, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
 
 
-def resolve_api_key(api_key: str | None) -> str | None:
-    """The key to send: ``api_key``, or STATELOCK_API_KEY when it is None. "" sends none."""
-    if api_key is None:
-        api_key = os.environ.get(API_KEY_ENV)
-    return api_key or None
+def resolve_api_key(api_key: str | None, default: str | None = None) -> str | None:
+    """The key to send: ``api_key``, else ``default``, else STATELOCK_API_KEY.
+
+    One rule everywhere: None means "not given" (fall back), "" means "send no key"
+    and is kept, so a session created with ``api_key=""`` never picks up the
+    environment's key for its later lookups either.
+    """
+    for key in (api_key, default):
+        if key is not None:
+            return key
+    return os.environ.get(API_KEY_ENV)
 
 
 @dataclass(frozen=True)
@@ -56,7 +62,7 @@ class SessionUrl:
     api_key: str | None = field(default=None, repr=False, compare=False)
 
     def _key(self, api_key: str | None) -> str | None:
-        return resolve_api_key(api_key if api_key is not None else self.api_key)
+        return resolve_api_key(api_key, self.api_key)
 
     def guard(self, api_key: str | None = None) -> AbstractAsyncContextManager[None]:
         """Raise StatelockPolicyViolationError (rule, reason) when Statelock ends this session."""
@@ -73,13 +79,13 @@ class SessionUrl:
     def violation(self, api_key: str | None = None) -> StatelockPolicyViolationError | None:
         """The violation that ended this session, or None if there is none (blocking).
 
-        Raises SessionUrlError when Statelock refuses the lookup (for example a wrong
+        Raises StatelockClientError when Statelock refuses the lookup (for example a wrong
         key) or cannot be reached: that is not the same as "no violation".
         """
         from statelock.client.violations import StatelockPolicyViolationError, lookup_violation  # noqa: PLC0415
 
         found = lookup_violation(self.cdp_url, self.session_id, self._key(api_key))
-        return StatelockPolicyViolationError(found) if found else None
+        return StatelockPolicyViolationError(found, recorded=True) if found else None
 
 
 def create_session_url(
@@ -102,7 +108,7 @@ def create_session_url(
     ends cleanly (no violation). The first run of a new name starts empty.
     """
     if save_session and not saved_session:
-        raise SessionUrlError("save_session needs saved_session")
+        raise StatelockClientError("save_session needs saved_session")
     body: dict[str, Any] = {}
     if agent_id:
         body["agent_id"] = agent_id
@@ -112,7 +118,7 @@ def create_session_url(
         body["saved_session_name"] = saved_session
         body["save_session"] = save_session
     key = resolve_api_key(api_key)
-    payload = _call("POST", "/sessions", server_url, key, body)
+    payload = request_json("POST", "/sessions", server_url, key, body)
     return SessionUrl(
         **{name: str(payload[name]) for name in ("session_id", "agent_id", "cdp_url", "ws_url", "expires_at")},
         saved_session=payload.get("saved_session_name"),
@@ -125,7 +131,7 @@ def list_saved_sessions(
 ) -> list[str]:
     """Names of the calling agent's saved browser sessions."""
     query = f"?agent_id={urllib.parse.quote(agent_id)}" if agent_id else ""
-    payload = _call("GET", f"/saved-sessions{query}", server_url, api_key)
+    payload = request_json("GET", f"/saved-sessions{query}", server_url, api_key)
     return [str(name) for name in payload.get("saved_sessions") or []]
 
 
@@ -134,11 +140,11 @@ def delete_saved_session(
 ) -> bool:
     """Delete one of the calling agent's saved browser sessions. False if it did not exist."""
     query = f"?agent_id={urllib.parse.quote(agent_id)}" if agent_id else ""
-    payload = _call("DELETE", f"/saved-sessions/{urllib.parse.quote(name)}{query}", server_url, api_key)
+    payload = request_json("DELETE", f"/saved-sessions/{urllib.parse.quote(name)}{query}", server_url, api_key)
     return bool(payload.get("deleted"))
 
 
-def _call(
+def request_json(
     method: str,
     path: str,
     server_url: str | None,
@@ -147,15 +153,17 @@ def _call(
     *,
     timeout: float = REQUEST_TIMEOUT,
 ) -> dict[str, Any]:
+    """One JSON request to the Statelock server (``server_url`` or STATELOCK_URL); the
+    client's shared transport. Any failure raises StatelockClientError (with the status)."""
     server = (server_url or os.environ.get(SERVER_ENV) or "").rstrip("/")
     if not server:
-        raise SessionUrlError("no Statelock server URL (pass server_url or set STATELOCK_URL)")
+        raise StatelockClientError("no Statelock server URL (pass server_url or set STATELOCK_URL)")
     if urllib.parse.urlsplit(server).scheme not in {"http", "https"}:
-        raise SessionUrlError(f"not an http(s) Statelock URL: {server}")
+        raise StatelockClientError(f"not an http(s) Statelock URL: {server}")
     key = resolve_api_key(api_key)
     headers = {"Content-Type": "application/json"}
     if key:
-        headers["Authorization"] = f"Bearer {key}"
+        headers["Authorization"] = f"Bearer {key}"  # "" sends none
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(  # noqa: S310 - http(s) checked above
         f"{server}{path}", data=data, headers=headers, method=method
@@ -165,9 +173,9 @@ def _call(
             payload = json.loads(response.read())
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", "replace")[:300]
-        raise SessionUrlError(f"Statelock refused the request ({error.code}): {detail}", error.code) from error
+        raise StatelockClientError(f"Statelock refused the request ({error.code}): {detail}", error.code) from error
     except OSError as error:  # URLError, a timeout, a refused connection
-        raise SessionUrlError(f"could not reach Statelock at {server}: {error}") from error
+        raise StatelockClientError(f"could not reach Statelock at {server}: {error}") from error
     except ValueError as error:  # not JSON
-        raise SessionUrlError(f"Statelock at {server} did not answer with JSON") from error
+        raise StatelockClientError(f"Statelock at {server} did not answer with JSON") from error
     return payload if isinstance(payload, dict) else {}

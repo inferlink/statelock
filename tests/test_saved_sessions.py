@@ -12,6 +12,7 @@ from statelock.saved_sessions import (
     SavedSessionError,
     SavedSessionKey,
     SavedSessionStore,
+    _origin_of,
     check_key_location,
 )
 from statelock.services import saved_session_store
@@ -123,3 +124,18 @@ def test_a_short_key_file_is_refused(tmp_path: Path) -> None:
     (tmp_path / "bad.key").write_bytes(b"short")
     with pytest.raises(ValueError, match="32 bytes"):
         AesGcmCipher.from_key_file(tmp_path / "bad.key")
+
+
+@pytest.mark.parametrize(
+    ("url", "origin"),
+    [
+        ("https://user:pw@example.test/app", "https://example.test"),  # user info is not part of the origin
+        ("https://example.test:443/app", "https://example.test"),  # default port dropped
+        ("http://Example.TEST:8080/", "http://example.test:8080"),
+        ("about:blank", None),
+        ("chrome://settings", None),
+        ("http://[::1", None),  # does not parse
+    ],
+)
+def test_local_storage_origin_of_a_page(url: str, origin: str | None) -> None:
+    assert _origin_of(url) == origin

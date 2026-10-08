@@ -20,6 +20,11 @@ Schema history (all changes so far are additive: readers of "1" can read "2"):
 - "4": ``policy_id`` (in verdicts, violations, review failures and
   ``post_conditions_evaluated``) names the policy, not the agent: the policy's ``id``
   from the policy file, or ``<agent_id>#<n>`` for the agent's n-th policy.
+  Also in "4": ``page_text_unread`` in ``browser_state`` / ``post_browser_state`` (shown
+  frames whose text could not be read); ``target_element.unresolved`` and
+  ``target_element.frame_url`` (an action into a frame Statelock cannot read);
+  ``params.statelock_follows_key_down`` on a key ``char`` event that types the key a
+  preceding ``rawKeyDown`` pressed (part of that key press, not a new activation).
 """
 
 from __future__ import annotations

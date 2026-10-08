@@ -23,8 +23,9 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from statelock.core.actions import KEY_DOWN_TYPES, KEY_METHOD, is_enter_key, is_pointer_method
-from statelock.core.state import ActionContext, BrowserState, normalized_label
+from statelock.core.actions import KEY_DOWN_TYPES, KEY_METHOD, is_pointer_method, pressed_key_names
+from statelock.core.state import ActionContext, BrowserState
+from statelock.policy.text import NonEmptyText, label_matches
 
 
 class ActionTrigger(BaseModel):
@@ -34,7 +35,7 @@ class ActionTrigger(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    click_text: list[str] = Field(default_factory=list)
+    click_text: list[NonEmptyText] = Field(default_factory=list)
     key: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -56,9 +57,7 @@ class ActionTrigger(BaseModel):
     def _key_matches(self, context: ActionContext) -> bool:
         if context.method != KEY_METHOD or not self.key:
             return False
-        pressed = {str(context.params.get(field) or "").casefold() for field in ("key", "code")}
-        if is_enter_key(context.params):
-            pressed.add("enter")
+        pressed = pressed_key_names(context.params)
         return any(key.casefold() in pressed for key in self.key)
 
     def _click_text_matches(self, context: ActionContext, state: BrowserState | None) -> bool:
@@ -70,5 +69,4 @@ class ActionTrigger(BaseModel):
         target = state.target_element if state else None
         if target is None:
             return is_pointer
-        text = target.normalized_label
-        return (not text and target.is_interactive) or any(normalized_label(value) in text for value in self.click_text)
+        return label_matches(target, self.click_text)

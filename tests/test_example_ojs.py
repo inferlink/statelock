@@ -30,7 +30,7 @@ from ojs_support import RULE_MODULE, ojs_policy, write_decisions  # noqa: E402
 from stagehand import ObserveResult  # noqa: E402
 
 import statelock.client  # noqa: E402
-from statelock.client import StatelockPolicyViolationError, create_session_url  # noqa: E402
+from statelock.client import StatelockPolicyViolationError  # noqa: E402
 
 pytestmark = pytest.mark.browser
 
@@ -80,27 +80,15 @@ def _settings(server: dict[str, Any], tmp_path: Path, **changes: Any) -> ojs_age
 def _run(
     server: dict[str, Any], settings: ojs_agent.AgentSettings, steps: Callable[[ojs_agent.OjsAgent], Awaitable[Any]]
 ) -> tuple[str, Any]:
-    """What ojs_agent.main() does: install, a session URL, ordinary Stagehand."""
-
-    async def session() -> tuple[str, Any]:
-        statelock.client.install()
-        url = create_session_url(
-            server["base"],
-            api_key=agent_key(AGENT),
-            saved_session=settings.saved_session,
-            save_session=bool(settings.saved_session),
-        )
-        stagehand = await ojs_agent.start_stagehand(settings, url.cdp_url)
-        try:
-            async with url.guard(api_key=agent_key(AGENT)):
-                return url.session_id, await steps(ojs_agent.OjsAgent(settings, stagehand))
-        except StatelockPolicyViolationError as violation:
-            return url.session_id, violation
-        finally:
-            await stagehand.close()
-            statelock.client.uninstall()
-
-    return asyncio.run(session())
+    """ojs_agent.main() with these settings and steps. Returns (session id, the steps'
+    result or the StatelockPolicyViolationError)."""
+    session = ojs_agent.open_session(settings, server["base"], api_key=agent_key(AGENT))
+    try:
+        return session.session_id, asyncio.run(ojs_agent.run_governed(settings, session, steps))
+    except StatelockPolicyViolationError as violation:
+        return session.session_id, violation
+    finally:
+        statelock.client.uninstall()
 
 
 def test_agent_screens_papers_and_records_a_decline(ojs: dict[str, Any], tmp_path: Path) -> None:
@@ -291,10 +279,7 @@ def test_the_email_must_be_the_decided_one(ojs: dict[str, Any], tmp_path: Path) 
     assert not ojs["journal"].submissions[102].declined
 
 
-def test_a_short_email_is_blocked_even_if_the_agent_allows_it(
-    ojs: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(ojs_agent, "MIN_EMAIL_CHARS", 0)  # the agent's own check is gone
+def test_a_short_email_is_blocked_even_if_the_agent_allows_it(ojs: dict[str, Any], tmp_path: Path) -> None:
     _, result = _run(ojs, _settings(ojs, tmp_path, record_decisions=True), _decline("No."))
     violation = _violation(result)
     assert (violation.policy_id, violation.rule) == ("ojs-workflow", "assert_compare")
@@ -329,3 +314,9 @@ def test_a_correct_decline_passes_every_check(ojs: dict[str, Any], tmp_path: Pat
     ]
     triggered = {e["policy_id"] for e in evaluated if e["triggered"]}
     assert triggered == {"ojs-login", "ojs-workflow"}  # the Login and both decline clicks were checked after
+
+
+def test_xpath_literals_quote_any_text() -> None:
+    assert ojs_agent.xpath_literal("Send to Review") == "'Send to Review'"
+    assert ojs_agent.xpath_literal("Editor's pick") == '"Editor\'s pick"'
+    assert ojs_agent.xpath_literal("""a'b"c""") == """concat('a', "'", 'b"c')"""

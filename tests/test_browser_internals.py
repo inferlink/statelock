@@ -27,7 +27,11 @@ async def _statelock_contexts(page: Any) -> tuple[Any, dict[str, dict[str, Any]]
     cdp.on("Runtime.executionContextCreated", lambda event: seen.setdefault(event["context"]["name"], event["context"]))
     await cdp.send("Runtime.enable")
     await page.mouse.move(5, 5)  # a governed action: Statelock's state world exists now
-    await page.wait_for_timeout(200)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 10
+    while not {"", "__statelock_guard", "__statelock_state"} <= seen.keys():
+        assert loop.time() < deadline, f"Statelock worlds not announced: {sorted(seen)}"
+        await asyncio.sleep(0.05)
     return cdp, seen
 
 
@@ -154,9 +158,59 @@ def test_page_state_url_contains_ignores_query_and_fragment(server: dict[str, An
             try:
                 page = await browser.new_page()
                 await page.goto(url)
-                return dict(await page.evaluate(f"({load_js('page_state.js')})(null, false, {json.dumps(specs)})"))
+                return dict(await page.evaluate(f"({load_js('page_state.js')})({json.dumps(specs)})"))
             finally:
                 await browser.close()
 
     state = asyncio.run(read(server["base"] + "/gov/form?next=/bank/#/bank/"))
     assert set(state["field_values"]) == {"here"}
+
+
+FIELDS_PAGE = """<html><body>
+<span id=amount data-statelock-value="$5.00">$9,000.00</span>
+<span data-statelock-key=marked data-statelock-value="$7.00">$1.00</span>
+<progress id=progress value=0.5 max=1></progress><meter id=empty value=0></meter>
+<ol><li id=item>First item</li></ol>
+<span class=price style="opacity:0">$1.00</span>
+<span class=price style="position:absolute;left:-9999px">$2.00</span>
+<div style="opacity:0"><span class=price>$3.00</span></div>
+<span class=price style="display:inline-block;width:0;height:0;overflow:hidden">$4.00</span>
+<div style="height:3000px"></div><span class=price>$5.00</span>
+</body></html>"""
+
+
+def _page_state(html: str, specs: list[dict[str, Any]]) -> dict[str, Any]:
+    async def read() -> dict[str, Any]:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                return dict(await page.evaluate(f"({load_js('page_state.js')})({json.dumps(specs)})"))
+            finally:
+                await browser.close()
+
+    return asyncio.run(read())
+
+
+def test_selector_fields_read_what_the_page_shows() -> None:
+    specs = [
+        {"name": "amount", "selector": "#amount"},
+        {"name": "progress", "selector": "#progress"},
+        {"name": "empty", "selector": "#empty"},
+        {"name": "item", "selector": "#item"},
+        {"name": "bad", "selector": "#["},  # cannot be read: left out, so its rules block
+        {"name": "price", "selector": ".price", "visible": True},
+        {"name": "shown", "selector": ".price", "visible": True, "read": "count"},
+    ]
+    state = _page_state(FIELDS_PAGE, specs)
+    values = state["field_values"]
+    # Markup cannot replace what a policy's selector field reads (only data-statelock-key fields).
+    assert values["amount"] == "$9,000.00"
+    assert state["extracted_fields"] == {"marked": "$7.00"}
+    # Numeric values (<progress>, <meter>, <li value>) neither break the capture nor read 0 as missing.
+    assert values["progress"] == "0.5" and values["empty"] == "0"
+    assert values["item"] == "First item"  # an <li> without value= reads its text, not 0
+    assert "bad" not in values
+    # Transparent, off-page and zero-sized elements are not shown; below the fold is.
+    assert values["price"] == "$5.00" and values["shown"] == "1"

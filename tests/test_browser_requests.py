@@ -132,7 +132,12 @@ def test_a_malformed_request_is_declined_and_the_session_continues(server: dict[
     async def steps(page: Any) -> list[str]:
         cdp = await page.context.new_cdp_session(page)
         errors = []
-        for params in ({"url": server["base"] + "/gov/me", "body": "not base64!"}, {"url": "ftp://x"}):
+        for params in (
+            {"url": server["base"] + "/gov/me", "body": "not base64!"},
+            {"url": "ftp://x"},
+            # Python reads the host after the "@"; the browser ends the host at the backslash.
+            {"url": server["base"] + "\\@localhost/gov/me"},
+        ):
             try:
                 await cdp.send("Statelock.fetch", params)
             except Exception as error:
@@ -141,8 +146,8 @@ def test_a_malformed_request_is_declined_and_the_session_continues(server: dict[
         return errors
 
     _, errors = run_session(server, AGENT, "/gov/form", steps)
-    assert "not valid base64" in errors[0] and "http(s) url" in errors[1]
-    assert errors[2] == "Form"
+    assert "not valid base64" in errors[0] and "http(s) url" in errors[1] and "backslash" in errors[2]
+    assert errors[3] == "Form"
 
 
 def test_a_secret_placeholder_that_is_not_allowed_ends_the_session(server: dict[str, Any]) -> None:

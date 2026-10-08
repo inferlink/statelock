@@ -30,6 +30,9 @@ def test_inject_replaces_placeholders_where_allowed(tmp_path: Path, monkeypatch:
         ({"agent_id": "other", "url": "https://x.test/login", "password_field": True}, "may not use"),
         ({"agent_id": "agent", "url": "https://x.test/home", "password_field": True}, "only be typed on pages"),
         ({"agent_id": "agent", "url": "https://x.test/loginfoo", "password_field": True}, "only be typed"),
+        # The scope's path starts the page's path: not a segment further down.
+        ({"agent_id": "agent", "url": "https://x.test/forum/posts/login", "password_field": True}, "only be typed"),
+        ({"agent_id": "agent", "url": "https://x.test/a/login/b", "password_field": True}, "only be typed"),
         # Another host, even one whose name or path contains the scope.
         ({"agent_id": "agent", "url": "https://evil.test/login", "password_field": True}, "only be typed"),
         ({"agent_id": "agent", "url": "https://x.test.evil.test/login", "password_field": True}, "only be typed"),
@@ -50,8 +53,8 @@ def test_inject_replaces_placeholders_where_allowed(tmp_path: Path, monkeypatch:
 
 def test_non_password_fields_can_be_allowed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = _store(tmp_path, monkeypatch, password_fields_only=False)
-    url = "https://X.test:443/app/login?next=/home"
-    assert store.inject("id {{secret:pw}}", agent_id="agent", url=url, password_field=False)[1] == ["pw"]
+    for url in ("https://X.test:443/login?next=/home", "https://x.test/login/", "https://x.test/login/step-2"):
+        assert store.inject("id {{secret:pw}}", agent_id="agent", url=url, password_field=False)[1] == ["pw"]
 
 
 @pytest.mark.parametrize(
@@ -95,7 +98,7 @@ def test_secrets_file_is_validated_at_startup(tmp_path: Path, monkeypatch: pytes
 
 def test_scrubber_removes_raw_and_json_escaped_values() -> None:
     scrubber = SecretScrubber()
-    assert not scrubber
+    assert scrubber.text("nothing [x]") == "nothing [x]"
     scrubber.add('p"a\\ss-é')
     message = json.dumps({"result": {"value": 'p"a\\ss-é'}})
     assert 'p\\"a' not in scrubber.text(message)
@@ -110,4 +113,8 @@ def test_dev_secrets_file_loads(monkeypatch: pytest.MonkeyPatch) -> None:
     if not path.exists():  # the Docker test image mounts only some files
         pytest.skip("docker/dev-secrets.yaml is not available")
     monkeypatch.setenv("OJS_PASSWORD", "mock-editor-pass")
-    assert SecretStore.load(path).names == ["ojs_password"]
+    store = SecretStore.load(path)
+    assert store.names == ["ojs_password"]
+    # The mock OJS login page, as the proxy's Chromium reaches it in compose.dev.yaml.
+    login = "http://ojs-mock:8081/index.php/journal/login"
+    assert store.inject("{{secret:ojs_password}}", agent_id="ojs_screening_agent", url=login, password_field=True)

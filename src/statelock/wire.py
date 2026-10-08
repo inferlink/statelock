@@ -26,17 +26,30 @@ STATELOCK_METHOD_PREFIX = "Statelock."
 SESSION_COMMAND = "Statelock.session"
 # Answered with the response of an HTTP request Statelock makes in the page (policy request_access).
 REQUEST_COMMAND = "Statelock.fetch"
+# Governed uploads (proxy/uploads.py): begin {name, mimeType?}, chunk {uploadId, data}, end {uploadId}.
+UPLOAD_BEGIN_COMMAND = "Statelock.uploadFileBegin"
+UPLOAD_CHUNK_COMMAND = "Statelock.uploadFileChunk"
+UPLOAD_END_COMMAND = "Statelock.uploadFileEnd"
+# Governed downloads (proxy/downloads.py): the session's downloads, and one chunk of a file.
+DOWNLOADS_COMMAND = "Statelock.downloads"
+DOWNLOAD_READ_COMMAND = "Statelock.downloadRead"
 
 # Application-defined WebSocket close codes (4000-4999).
 CLOSE_CODE_UNREGISTERED_AGENT = 4401
 CLOSE_CODE_PRE_CONDITION = 4403
 CLOSE_CODE_INVALID_SESSION_ID = 4409
 CLOSE_CODE_POST_CONDITION = 4412
+# Standard WebSocket close code: the session failed inside Statelock (see the proxy log).
+CLOSE_CODE_INTERNAL_ERROR = 1011
 
 # CDP / JSON-RPC server error code used for in-band violation responses.
 CDP_VIOLATION_ERROR_CODE = -32000
-# Error code for a malformed or rejected Statelock.* command.
-CDP_INVALID_PARAMS_ERROR_CODE = -32602
+# Error code of every command Statelock refuses or declines without ending the session
+# (a malformed Statelock.* command, a policy decline, a failed Statelock.fetch).
+STATELOCK_ERROR_CODE = -32602
+# JSON-RPC: the message is not a JSON object; the message has no valid integer id.
+PARSE_ERROR = -32700
+INVALID_REQUEST = -32600
 
 # WebSocket close reasons are limited to 123 bytes of UTF-8.
 MAX_CLOSE_REASON_BYTES = 123
@@ -61,8 +74,7 @@ def truncate_utf8(value: str, max_bytes: int = MAX_CLOSE_REASON_BYTES) -> str:
 
 def encode_violation(violation: dict[str, Any]) -> str:
     """Render a violation as the CDP error message string."""
-    compact = {key: violation.get(key) for key in VIOLATION_FIELDS}
-    return f"{VIOLATION_MARKER} {json.dumps(compact, separators=(',', ':'))}"
+    return _marked({key: violation.get(key) for key in VIOLATION_FIELDS})
 
 
 def encode_close_reason(violation: dict[str, Any]) -> str:
@@ -79,11 +91,16 @@ def encode_close_reason(violation: dict[str, Any]) -> str:
         "s": violation.get("session_id"),
         "n": violation.get("sequence"),
     }
-    reason = f"{VIOLATION_MARKER} {json.dumps(compact, separators=(',', ':'))}"
+    reason = _marked(compact)
     if len(reason.encode("utf-8")) > MAX_CLOSE_REASON_BYTES:
         compact.pop("r")
-        reason = f"{VIOLATION_MARKER} {json.dumps(compact, separators=(',', ':'))}"
+        reason = _marked(compact)
     return truncate_utf8(reason)
+
+
+def _marked(payload: dict[str, Any]) -> str:
+    """The violation marker followed by the payload as compact JSON."""
+    return f"{VIOLATION_MARKER} {json.dumps(payload, separators=(',', ':'))}"
 
 
 def decode_violation(message: str) -> dict[str, Any] | None:
@@ -111,7 +128,7 @@ def decode_violation(message: str) -> dict[str, Any] | None:
 
 def statelock_error(message: str) -> dict[str, Any]:
     """A CDP error body for a command Statelock refuses or answers itself."""
-    return {"error": {"code": CDP_INVALID_PARAMS_ERROR_CODE, "message": f"Statelock: {message}"}}
+    return {"error": {"code": STATELOCK_ERROR_CODE, "message": f"Statelock: {message}"}}
 
 
 def cdp_response(request: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:

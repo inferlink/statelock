@@ -4,10 +4,10 @@ What Statelock does today and what is planned next. [COVERAGE.md](https://github
 
 ## Shipped in 0.1
 
-- **CDP proxy.** A governed Chromium per session; agents connect with an API key or a single-use session URL.
+- **CDP proxy.** A governed Chromium per session, with CDP over a pipe (no DevTools port) and its sandbox on in Docker; agents connect with an API key or a single-use session URL.
 - **Governed input.** Mouse, keyboard, text, touch, drag and drop, IME and gestures: state capture, pre-conditions, post-conditions after commit actions.
 - **Page guard.** Synthetic events, code-set files, `form.submit()` and requests started by agent page code are blocked; script clicks are replayed as governed real clicks.
-- **Policies.** Fields by markup, selector or URL; remembered values across pages; text, equality, numeric, click-text, upload and download rules; triggers; custom rules from plugins.
+- **Policies.** Fields by markup, selector or URL; remembered values across pages; text, equality, numeric, click-text, upload and download rules; triggers; custom rules (`statelock.rules` entry points or `STATELOCK_RULE_MODULES`).
 - **Visual checks.** `visual_assert` with any vision model litellm supports, hosted or local, failing closed.
 - **Human review.** `on_fail: review` pauses an action for a reviewer (web page and API).
 - **Files.** Governed uploads and downloads, recorded with size and SHA-256.
@@ -27,7 +27,3 @@ What Statelock does today and what is planned next. [COVERAGE.md](https://github
 - Uploads into file inputs inside iframes.
 - Upload and download rules on file contents (type sniffing, malware scanning), not only name, extension, size and count.
 - Open questions: support for other CDP clients and protocols, such as Selenium and WebDriver BiDi.
-
-## Statelock Enclave
-
-Tamper-evident evidence storage, independent verification and a forensic dashboard come from Statelock Enclave, InferLink's commercial add-on (see the [README](https://github.com/inferlink/statelock/blob/main/README.md#statelock-enclave)).

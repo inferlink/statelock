@@ -32,17 +32,20 @@ back/forward).
 
 from __future__ import annotations
 
-import math
 import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from statelock.core.state import BrowserState
 from statelock.core.urls import origin_and_path, url_in_scope
+from statelock.policy.currency import code_matches, has_unclear_code
+from statelock.policy.patterns import checked_regex
+from statelock.policy.text import normalize_text
 
 REMEMBERED_PREFIX = "remembered."
 FIELD_NAME_PATTERN = r"^[A-Za-z_][A-Za-z0-9_]*$"
@@ -67,29 +70,42 @@ class FieldSpec(BaseModel):
     remember: bool = False
     allowed_origins: list[str] = Field(default_factory=list)
 
+    @field_validator("pattern")
+    @classmethod
+    def _one_group_pattern(cls, value: str | None) -> str | None:
+        checked = checked_regex(value, "pattern")
+        if checked is not None and re.compile(checked).groups > 1:
+            raise ValueError("pattern may have at most one group")
+        return value
+
     @model_validator(mode="after")
-    def _check(self) -> FieldSpec:
+    def _exact_origins(self) -> FieldSpec:
         for origin in self.allowed_origins:
             parsed = origin_and_path(origin)
-            if parsed is None or parsed[0] != origin or parsed[1] not in {"", "/"} or "@" in origin:
+            if (
+                parsed is None
+                or parsed[0] != origin
+                or parsed[1] not in {"", "/"}
+                or "@" in origin
+                or not origin.startswith(("http://", "https://"))
+            ):
                 raise ValueError(f"field {self.name}: allowed_origins must contain exact http(s) origins")
-            if not origin.startswith(("http://", "https://")):
-                raise ValueError(f"field {self.name}: allowed_origins must contain exact http(s) origins")
+        return self
+
+    @model_validator(mode="after")
+    def _one_source(self) -> FieldSpec:
         if sum((self.selector is not None, self.key is not None, self.from_url)) != 1:
             raise ValueError(f"field {self.name}: set exactly one of selector, key or from_url")
+        return self
+
+    @model_validator(mode="after")
+    def _selector_options(self) -> FieldSpec:
         selector_only = {"attribute": self.attribute, "frame": self.frame, "visible": self.visible or None}
         needs_selector = sorted(name for name, value in selector_only.items() if value is not None)
         if self.read != "text":
             needs_selector.append("read")
         if needs_selector and self.selector is None:
             raise ValueError(f"field {self.name}: {', '.join(needs_selector)} requires selector")
-        if self.pattern is not None:
-            try:
-                compiled = re.compile(self.pattern)
-            except re.error as error:
-                raise ValueError(f"field {self.name}: invalid pattern: {error}") from error
-            if compiled.groups > 1:
-                raise ValueError(f"field {self.name}: pattern may have at most one group")
         return self
 
 
@@ -131,7 +147,9 @@ def apply_pattern(raw: str, pattern: str | None) -> str | None:
     match = re.search(pattern, raw)
     if match is None:
         return None
-    return (match.group(1) if match.re.groups else match.group(0)).strip()
+    value = match.group(1) if match.re.groups else match.group(0)
+    # An optional group that took no part in the match: the value is missing.
+    return value.strip() if value is not None else None
 
 
 def resolve_fields(
@@ -173,26 +191,35 @@ _NUMBER = re.compile(r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
 _CURRENCY = "¤"  # every currency symbol (Unicode category Sc) is mapped to this one
 _SIGNS = "+-"
 # The amount around the number: "(", a sign right before the currency or the digits,
-# the currency (a symbol, which may be followed by the sign, or an ISO code such as
-# USD), the number, a currency after it and ")".
+# the currency (which may be followed by the sign), the number, a currency after it and ")".
 _AMOUNT = re.compile(
     r"(?P<open>\(\s*)?"
-    rf"(?P<sign>[{_SIGNS}](?=[{_CURRENCY}\d]|[A-Z]{{3}}\b))?"
-    rf"(?:{_CURRENCY}\s*(?P<inner_sign>[{_SIGNS}](?=\d))?|\b[A-Z]{{3}}\b\s*)?"
+    rf"(?P<sign>[{_SIGNS}](?=[{_CURRENCY}\d]))?"
+    rf"(?:{_CURRENCY}\s*(?P<inner_sign>[{_SIGNS}](?=\d))?)?"
     r"(?P<number>\d[\d,]*(?:\.\d+)?)"
-    rf"(?:\s*(?:{_CURRENCY}|\b[A-Z]{{3}}\b))?"
+    rf"(?:\s*{_CURRENCY})?"
     r"(?P<close>\s*\))?"
 )
 
 
-def _normalize_number_text(text: str) -> str:
-    """NFKC (full-width digits and parentheses), the Unicode minus as "-", one currency symbol."""
-    text = unicodedata.normalize("NFKC", text).replace("\u2212", "-")
-    return "".join(_CURRENCY if unicodedata.category(ch) == "Sc" else ch for ch in text).strip()
+def _normalize_number_text(text: str) -> str | None:
+    """normalize_text keeping case (full-width digits and parentheses, invisible characters),
+    the Unicode minus as "-", and every currency (symbol or code, statelock.policy.currency)
+    as one symbol. None when the currency is unclear ("usd 5")."""
+    text = normalize_text(text, casefold=False)
+    if has_unclear_code(text):
+        return None
+    for match in reversed(code_matches(text)):
+        text = text[: match.start()] + _CURRENCY + text[match.end() :]
+    text = text.replace("\u2212", "-")
+    return "".join(_CURRENCY if unicodedata.category(ch) == "Sc" else ch for ch in text)
 
 
-def parse_number(value: Any) -> float | None:
+def parse_number(value: Any) -> Decimal | None:
     """Parse an amount such as "$5,000.00", "USD 1200", "-$5", "$-5", "\u22125" or "(1,234.00)" (negative).
+
+    Currency codes are recognised as in statelock.policy.currency: upper case, next to
+    the number. A code in lower or mixed case there ("usd 5") makes the amount unclear: None.
 
     The text must contain exactly one number: "Qty 2 x $500" or "Invoice #12 $5,000.00"
     return None, so a comparison fails closed instead of checking the wrong amount.
@@ -201,23 +228,30 @@ def parse_number(value: Any) -> float | None:
     sign apart from the amount ("- 5"), a hyphen ("INV-5"), two signs, a sign inside
     parentheses, a parenthesis without its pair, or parentheses that do not enclose
     the whole text ("Fee ($5)").
+
+    The result is exact at any length (a Decimal); non-finite numbers return None.
     """
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
-        return float(value) if math.isfinite(value) else None
+    if isinstance(value, (int, float, Decimal)):
+        return _exact_number(value)
     text = _normalize_number_text(str(value))
-    token = _single_number(text)
-    if token is None:
+    token = _single_number(text) if text is not None else None
+    if text is None or token is None:
         return None
     amount = next((m for m in _AMOUNT.finditer(text) if m.start("number") == token.start()), None)
     negative = _is_negative(text, amount) if amount is not None else None
     if negative is None:
         return None
-    number = float(token.group().replace(",", ""))
-    if not math.isfinite(number):
-        return None
-    return -number if negative else number
+    number = Decimal(token.group().replace(",", ""))
+    # copy_negate: unary minus would round to the context precision.
+    return number.copy_negate() if negative else number
+
+
+def _exact_number(value: float | Decimal) -> Decimal | None:
+    # repr: the shortest text that is this float, so 0.1 is Decimal("0.1").
+    number = Decimal(repr(value)) if isinstance(value, float) else Decimal(value)
+    return number if number.is_finite() else None
 
 
 def _single_number(text: str) -> re.Match[str] | None:

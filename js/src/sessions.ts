@@ -9,32 +9,8 @@
  * The URL works once and expires after a few minutes.
  */
 
-import { StatelockPolicyViolationError, guard } from "./violations.js";
-
-export const API_KEY_ENV = "STATELOCK_API_KEY";
-export const SERVER_ENV = "STATELOCK_URL";
-const REQUEST_TIMEOUT_MS = 10_000;
-
-/** Statelock refused or could not answer a request (session URLs, saved sessions,
- *  violation lookups). `status` is the HTTP status when Statelock answered. */
-export class SessionUrlError extends Error {
-  readonly status: number | undefined;
-
-  constructor(message: string, status?: number, options?: { cause?: unknown }) {
-    super(message, options);
-    this.name = "SessionUrlError";
-    this.status = status;
-  }
-}
-
-export interface ClientOptions {
-  /** The Statelock server, e.g. http://localhost:8010 (default: STATELOCK_URL). */
-  serverUrl?: string;
-  /** The agent's key (default: STATELOCK_API_KEY). */
-  apiKey?: string;
-  /** Only when the proxy's authentication is off. */
-  agentId?: string;
-}
+import { type ClientOptions, StatelockClientError, apiKey, call, serverUrl } from "./http.js";
+import { type StatelockPolicyViolationError, guard, lookupViolation } from "./violations.js";
 
 export interface SessionUrlOptions extends ClientOptions {
   ttlSeconds?: number;
@@ -55,66 +31,18 @@ export interface SessionUrl {
   savedSession: string | null;
   /** Run fn; if Statelock ends the session, throw StatelockPolicyViolationError (rule, reason). */
   guard<T>(fn: () => Promise<T>): Promise<T>;
-}
-
-function env(name: string): string | undefined {
-  const value = typeof process !== "undefined" ? process.env[name] : undefined;
-  return value ? value : undefined;
-}
-
-export function serverUrl(options: ClientOptions): string {
-  const server = (options.serverUrl ?? env(SERVER_ENV) ?? "").replace(/\/+$/, "");
-  if (!server) {
-    throw new SessionUrlError("no Statelock server URL (pass serverUrl or set STATELOCK_URL)");
-  }
-  return server;
-}
-
-export function apiKey(options: ClientOptions): string | undefined {
-  return options.apiKey ?? env(API_KEY_ENV);
-}
-
-export async function call(
-  method: string,
-  path: string,
-  options: ClientOptions,
-  body?: Record<string, unknown>,
-  timeoutMs = REQUEST_TIMEOUT_MS,
-): Promise<Record<string, unknown>> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  const key = apiKey(options);
-  if (key) headers.Authorization = `Bearer ${key}`;
-  const server = serverUrl(options);
-  let response: Response;
-  let text: string;
-  try {
-    response = await fetch(`${server}${path}`, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    text = await response.text();
-  } catch (error) {
-    // A refused connection, a DNS failure or the timeout: one error type for callers.
-    throw new SessionUrlError(`could not reach Statelock at ${server}: ${String(error)}`, undefined, { cause: error });
-  }
-  if (!response.ok) {
-    throw new SessionUrlError(`Statelock refused the request (${response.status}): ${text.slice(0, 300)}`, response.status);
-  }
-  let payload: unknown;
-  try {
-    payload = text ? JSON.parse(text) : {};
-  } catch (error) {
-    throw new SessionUrlError(`Statelock at ${server} did not answer with JSON`, response.status, { cause: error });
-  }
-  return payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+  /**
+   * The violation that ended this session, or null if there is none. A lookup Statelock
+   * refuses (a wrong key) or cannot answer throws StatelockClientError: that is not "no
+   * violation". apiKey defaults to the key the session was created with.
+   */
+  violation(apiKey?: string): Promise<StatelockPolicyViolationError | null>;
 }
 
 /** Ask Statelock for a single-use session URL for the agent the key belongs to. */
 export async function createSessionUrl(options: SessionUrlOptions = {}): Promise<SessionUrl> {
   if (options.saveSession && !options.savedSession) {
-    throw new SessionUrlError("saveSession needs savedSession");
+    throw new StatelockClientError("saveSession needs savedSession");
   }
   const body: Record<string, unknown> = {};
   if (options.agentId) body.agent_id = options.agentId;
@@ -135,6 +63,7 @@ export async function createSessionUrl(options: SessionUrlOptions = {}): Promise
     expiresAt: String(payload.expires_at),
     savedSession: typeof payload.saved_session_name === "string" ? payload.saved_session_name : null,
     guard: <T>(fn: () => Promise<T>) => guard(fn, { serverUrl: server, sessionId, apiKey: key }),
+    violation: (lookupKey?: string) => lookupViolation(server, sessionId, lookupKey ?? key),
   };
 }
 
@@ -152,5 +81,3 @@ export async function deleteSavedSession(name: string, options: ClientOptions = 
   const payload = await call("DELETE", `/saved-sessions/${encodeURIComponent(name)}${query}`, options);
   return payload.deleted === true;
 }
-
-export { StatelockPolicyViolationError };

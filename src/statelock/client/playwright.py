@@ -34,13 +34,19 @@ from playwright.sync_api import Browser as SyncBrowser
 from playwright.sync_api import Page as SyncPage
 from playwright.sync_api import Playwright as SyncPlaywright
 
+from statelock.client.files import FileMethods
+from statelock.client.files_sync import FileMethodsSync
 from statelock.client.sessions import SessionUrl, create_session_url
 
 
 @dataclass
-class PlaywrightSession:
+class PlaywrightSession(FileMethods):
     """A Statelock session plus the async Playwright browser connected to it.
-    ``async with`` closes the browser connection at the end."""
+    ``async with`` closes the browser connection at the end.
+
+    Without ``install()``, ``set_input_files(target, files)`` and ``expect_download()``
+    upload and download through Statelock (on ``page``, or the ``page=`` given).
+    """
 
     session: SessionUrl
     browser: AsyncBrowser
@@ -69,9 +75,10 @@ class PlaywrightSession:
 
 
 @dataclass
-class PlaywrightSessionSync:
+class PlaywrightSessionSync(FileMethodsSync):
     """A Statelock session plus the sync Playwright browser connected to it.
-    ``with`` closes the browser connection at the end."""
+    ``with`` closes the browser connection at the end. ``set_input_files`` and
+    ``expect_download`` as in PlaywrightSession."""
 
     session: SessionUrl
     browser: SyncBrowser

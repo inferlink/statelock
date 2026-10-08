@@ -11,8 +11,6 @@ venv/
 .env
 .DS_Store
 artifacts/
-*.docx
-~$*
 /keys.yaml
 .venv*/
 ojs-output/

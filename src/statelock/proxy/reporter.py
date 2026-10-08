@@ -7,17 +7,17 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import Callable
 from typing import Any
 
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
 from statelock import events as event_names
-from statelock.core.actions import CdpAction, parse_cdp_message
-from statelock.core.jsonutil import as_str
+from statelock.core.actions import CdpAction
+from statelock.core.jsonutil import as_str, parse_cdp_message
 from statelock.core.state import ActionContext
 from statelock.core.verdict import PolicyVerdict
+from statelock.credentials import SecretScrubber
 from statelock.events import Events
 from statelock.registry import ViolationRegistry
 from statelock.wire import (
@@ -72,6 +72,7 @@ class ViolationReporter:
         registry: ViolationRegistry,
         events: Events,
         close_delay: float = 0.5,
+        scrubber: SecretScrubber | None = None,
     ) -> None:
         self.client_ws = client_ws
         self.registry = registry
@@ -81,14 +82,14 @@ class ViolationReporter:
         # Set with terminating: wakes an action paused for review (the session is ending).
         self.terminated = asyncio.Event()
         self.client_closed = False
-        # The governor sets this to its secret scrubber: a rule's reason can quote a field value.
-        self.scrub: Callable[[Any], Any] = lambda value: value
+        # The session's secret scrubber: a rule's reason can quote a field value.
+        self.scrubber = scrubber or SecretScrubber()
         self._violation: dict[str, Any] | None = None
 
     async def _record(self, context: ActionContext, verdict: PolicyVerdict) -> dict[str, Any]:
         self.terminating = True
         self.terminated.set()
-        violation: dict[str, Any] = self.scrub(build_violation(context, verdict))
+        violation: dict[str, Any] = self.scrubber.data(build_violation(context, verdict))
         self._violation = violation
         self.registry.record(violation)
         await self.events.emit(event_names.VIOLATION, violation)

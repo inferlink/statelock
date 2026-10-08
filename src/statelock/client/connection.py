@@ -1,38 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Connecting a Playwright agent to Statelock with headers (instead of a session URL)."""
+"""Connecting with WebSocket headers instead of a session URL (not part of the public API).
+
+Agents use a session URL (``connect_playwright``, ``create_session_url``). An agent
+that can send headers may instead connect to ``ws://.../statelock`` with
+``Authorization: Bearer <key>`` and the agent and session id headers; the test
+suite does this to choose its session ids.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import uuid
-from collections.abc import AsyncIterator, Sequence
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from typing import Any
 
-from playwright.async_api import Browser, Locator, Page, Playwright
+from playwright.async_api import Browser, Page, Playwright
 
-from statelock.client import files, transfer
+from statelock.client.files import FileMethods
 from statelock.client.sessions import resolve_api_key
-from statelock.client.transfer import UploadFile
-from statelock.client.violations import StatelockPolicyViolationError, complete_violation, statelock_guard
+from statelock.client.violations import statelock_guard
 from statelock.wire import AGENT_ID_HEADER, SESSION_ID_HEADER
-
-DOWNLOAD_TIMEOUT = 30.0
 
 
 @dataclass
-class StatelockConnection:
-    """One Statelock session: the agent's identity, and the browser once connected.
-
-    ``connect_statelock`` creates and connects one. An agent framework that opens its
-    own CDP connection (for example Stagehand's ``cdp_url``) creates one directly,
-    passes ``headers`` to that connection, then calls ``attach`` with the browser:
-
-        conn = StatelockConnection("ws://localhost:8010/statelock", "my_agent")
-        browser = await playwright.chromium.connect_over_cdp(conn.endpoint_url, headers=conn.headers)
-        conn.attach(browser)
-    """
+class HeaderConnection(FileMethods):
+    """One Statelock session opened with headers: the agent's identity, and the
+    browser once connected (``attach``)."""
 
     endpoint_url: str
     agent_id: str
@@ -55,64 +48,39 @@ class StatelockConnection:
     @property
     def browser(self) -> Browser:
         if self._browser is None:
-            raise RuntimeError("StatelockConnection is not connected: call attach() or use connect_statelock()")
+            raise RuntimeError("HeaderConnection is not connected: call attach() or use connect_with_headers()")
         return self._browser
 
+    @property
+    def page(self) -> Page:
+        """The first page in the governed browser context."""
+        return self.browser.contexts[0].pages[0]
+
     def attach(self, browser: Browser) -> None:
-        """Record the browser connected with ``headers`` (by this SDK or an agent framework)."""
+        """Record the browser connected with ``headers``."""
         self._browser = browser
 
-    def guard(self) -> AbstractAsyncContextManager[None]:
-        """Context manager that raises StatelockPolicyViolationError for violations."""
-        return statelock_guard(self.endpoint_url, self.session_id, self.api_key or "")
-
-    async def set_input_files(
-        self,
-        page: Page,
-        target: str | Locator,
-        files_to_upload: UploadFile | Sequence[UploadFile],
-    ) -> list[dict[str, Any]]:
-        """Upload files to Statelock and put them into a file input, as a governed action.
-
-        ``target`` is a Playwright selector or Locator for an ``<input type=file>``
-        in the page's main frame. Returns what Statelock stored for each file
-        (path, name, size, sha256, mimeType); the same data is in the action record.
-        """
-        return await files.set_input_files(page, target, files_to_upload)
-
-    @asynccontextmanager
-    async def expect_download(
-        self, page: Page, timeout: float = DOWNLOAD_TIMEOUT
-    ) -> AsyncIterator[files.DownloadWaiter]:
-        """Wait for the next download the block starts, after Statelock has checked it.
-
-        Raises StatelockPolicyViolationError if Statelock blocked the download.
-        """
-        async with files.expect_download(page, timeout, self._blocked) as waiter:
-            yield waiter
-
-    async def _blocked(self, blocked: transfer.DownloadBlocked) -> BaseException:
-        error = StatelockPolicyViolationError(transfer.blocked_violation(blocked, self.session_id))
-        return await asyncio.to_thread(
-            complete_violation, error, self.endpoint_url, self.session_id, self.api_key or ""
-        )
+    def guard(self, api_key: str | None = None) -> AbstractAsyncContextManager[None]:
+        """Raise StatelockPolicyViolationError when Statelock blocks the session.
+        api_key defaults to the connection's key."""
+        return statelock_guard(self.endpoint_url, self.session_id, resolve_api_key(api_key, self.api_key))
 
 
-async def connect_statelock(
+async def connect_with_headers(
     playwright: Playwright,
     endpoint_url: str,
     agent_id: str,
     session_id: str | None = None,
     api_key: str | None = None,
     **kwargs: Any,
-) -> StatelockConnection:
-    """Connect Playwright to Statelock, authenticate, and identify the agent and session.
+) -> HeaderConnection:
+    """Connect Playwright to ``endpoint_url`` (ws://.../statelock) with the identity headers.
 
     api_key defaults to the STATELOCK_API_KEY environment variable. Without a key
     the proxy accepts the connection only when its authentication is off.
     """
     identity = {"session_id": session_id} if session_id is not None else {}
-    conn = StatelockConnection(endpoint_url, agent_id, api_key=api_key, **identity)
+    conn = HeaderConnection(endpoint_url, agent_id, api_key=api_key, **identity)
     headers = {**(kwargs.pop("headers", None) or {}), **conn.headers}
     conn.attach(await playwright.chromium.connect_over_cdp(endpoint_url, headers=headers, **kwargs))
     return conn

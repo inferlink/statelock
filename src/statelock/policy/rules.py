@@ -19,9 +19,11 @@ Every pre-condition rule takes ``on_fail``: ``block`` (default) ends the session
 
 from __future__ import annotations
 
+import operator
 import re
-import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -30,24 +32,34 @@ from statelock.core.actions import (
     DOWNLOAD_METHOD,
     FILE_UPLOAD_METHOD,
     KEY_METHOD,
-    ActionKind,
     is_activation_key,
     is_pointer_method,
     starts_activation,
 )
-from statelock.core.state import ActionContext, BrowserState, normalized_label
+from statelock.core.jsonutil import as_int
+from statelock.core.state import ActionContext, BrowserState
+from statelock.policy.currency import currencies
 from statelock.policy.fields import REMEMBERED_PREFIX, parse_number
 from statelock.policy.patterns import checked_regex
 from statelock.policy.perception import ExtractType, PerceptionEvaluator, PerceptionRequest
+from statelock.policy.text import (
+    NonEmptyText,
+    compact_text,
+    comparable_text,
+    matched_value,
+    normalize_text,
+    unreadable_label,
+)
 from statelock.policy.triggers import ActionTrigger
 
 Phase = Literal["pre", "post"]
 OnFail = Literal["block", "review"]
 DEFAULT_CHECK_TIMEOUT = 30.0
 TRIGGER_KEY = "trigger"
-# An empty text would be contained in every page and every label.
-NonEmptyText = Annotated[str, Field(min_length=1)]
+
+
 FieldRef = Annotated[str, Field(pattern=r"^(?:remembered\.)?[A-Za-z_][A-Za-z0-9_]*$")]
+REMEMBERED_REF = re.compile(re.escape(REMEMBERED_PREFIX) + r"([A-Za-z_][A-Za-z0-9_]*)")
 
 
 @dataclass
@@ -66,10 +78,7 @@ class RuleContext:
 
     @property
     def is_activation(self) -> bool:
-        """A press, tap, drop, upload, or Enter/Space/shortcut key down (core.actions.starts_activation).
-        An action of an unknown kind counts as one, so checks limited to activations still run."""
-        if self.action.action_kind not in {kind.value for kind in ActionKind}:
-            return True
+        """A press, tap, drop, upload, or Enter/Space/shortcut key down (core.actions.starts_activation)."""
         return starts_activation(self.action.method, self.action.params)
 
     @property
@@ -129,6 +138,21 @@ class Rule(BaseModel):
 
     async def check(self, ctx: RuleContext) -> RuleFailure | None:
         raise NotImplementedError
+
+    def remembered_names(self) -> set[str]:
+        """The names this rule reads as ``remembered.<name>`` (checked when the policy loads)."""
+        return set(_remembered_names(self.model_dump(exclude={"trigger"})))
+
+
+def _remembered_names(value: Any) -> list[str]:
+    if isinstance(value, str):
+        match = REMEMBERED_REF.fullmatch(value)
+        return [match.group(1)] if match else []
+    if isinstance(value, dict):
+        return [name for item in value.values() for name in _remembered_names(item)]
+    if isinstance(value, (list, tuple, set)):
+        return [name for item in value for name in _remembered_names(item)]
+    return []
 
 
 RULES: dict[str, type[Rule]] = {}
@@ -208,16 +232,14 @@ class ProhibitClickText(Rule):
                 "Blocked click because the click target could not be resolved, "
                 "so prohibited click text could not be verified."
             )
-        text = target.normalized_label
-        if not text and target.is_interactive:
-            return RuleFailure("Blocked activation because the target has no readable label")
+        if unreadable_label(target):
+            where = "is in a frame Statelock cannot read" if target.unresolved else "has no readable label"
+            return RuleFailure(f"Blocked activation because the target {where}")
+        value = matched_value(target, self.values)
+        if value is None:
+            return None
         action_name = "click" if ctx.is_pointer else "key activation"
-        for value in self.values:
-            if normalized_label(value) in text:
-                return RuleFailure(
-                    f"Blocked {action_name} because target element text matched prohibited value: {value}"
-                )
-        return None
+        return RuleFailure(f"Blocked {action_name} because target element text matched prohibited value: {value}")
 
 
 @register_rule
@@ -227,16 +249,17 @@ class RequirePageText(Rule):
     values: list[NonEmptyText] = Field(min_length=1)
 
     async def check(self, ctx: RuleContext) -> RuleFailure | None:
-        page_text = (ctx.state.page_text or "").casefold() if ctx.state else ""
+        page_text = normalize_text(ctx.state.page_text or "") if ctx.state else ""
         for value in self.values:
-            if value.casefold() not in page_text:
+            if normalize_text(value) not in page_text:
                 return RuleFailure(f"Blocked action because required page text was missing: {value}")
         return None
 
 
 @register_rule
 class ProhibitPageText(Rule):
-    """The page text must not contain any listed value (e.g. a login form after logging in)."""
+    """The page text must not contain any listed value (e.g. a login form after logging in).
+    Spaces do not count, so the value is also found when the page splits or joins its words."""
 
     rule_name: ClassVar[str] = "prohibit_page_text"
 
@@ -245,60 +268,36 @@ class ProhibitPageText(Rule):
     async def check(self, ctx: RuleContext) -> RuleFailure | None:
         if ctx.state is None:
             return RuleFailure("Blocked action because the page text could not be checked (no page state)")
-        page_text = (ctx.state.page_text or "").casefold()
+        page_text = compact_text(ctx.state.page_text or "")
         for value in self.values:
-            if value.casefold() in page_text:
+            if compact_text(value) in page_text:
                 return RuleFailure(f"Blocked action because the page shows prohibited text: {value}")
         if ctx.state.page_text_truncated:
             return RuleFailure("Blocked action because prohibited text could not be checked on the whole page")
+        # Parts of the page Statelock could not read (a cross-origin frame, a closed shadow root).
+        if ctx.state.page_text_unread:
+            return RuleFailure(
+                "Blocked action because prohibited text could not be checked in parts of the page",
+                {"page_text_unread": list(ctx.state.page_text_unread)},
+            )
         return None
 
 
 def values_equal(left: str, right: str) -> bool:
     """Equal as numbers when both parse ("5000" == "$5,000.00"), otherwise as normalized
-    text (see normalize_comparable_value). When both sides show a currency symbol, the
-    symbols must be the same ("€5" != "£5")."""
-    left_currency, right_currency = currency_symbols(left), currency_symbols(right)
-    if left_currency and right_currency and left_currency != right_currency:
-        return False
-    left_codes, right_codes = currency_codes(left), currency_codes(right)
-    if left_codes and right_codes and left_codes != right_codes:
+    text (statelock.policy.text.comparable_text). When both sides name a currency, the currencies
+    must be the same (statelock.policy.currency: "€5" != "£5", "$5" != "5 USD")."""
+    left_currencies, right_currencies = currencies(left), currencies(right)
+    if left_currencies and right_currencies and left_currencies != right_currencies:
         return False
     left_number, right_number = parse_number(left), parse_number(right)
     if left_number is not None and right_number is not None:
         return left_number == right_number
-    left_text, right_text = normalize_comparable_value(left), normalize_comparable_value(right)
+    left_text, right_text = comparable_text(left), comparable_text(right)
     if not left_text or not right_text:
         # Two different texts never become equal by losing all their characters ("!" == "?").
         return not left.strip() and not right.strip()
     return left_text == right_text
-
-
-def currency_symbols(value: str) -> set[str]:
-    return {char for char in unicodedata.normalize("NFKC", value) if unicodedata.category(char) == "Sc"}
-
-
-def currency_codes(value: str) -> set[str]:
-    return set(re.findall(r"\b(?:USD|EUR|GBP|JPY|CAD|AUD|CHF|CNY|INR)\b", value.upper()))
-
-
-def normalize_comparable_value(value: str) -> str:
-    """NFKC and casefold; whitespace, invisible format characters and punctuation removed.
-    Punctuation between two digits ("12/05", "1.5") and a leading sign ("-5") are kept,
-    so differently formatted numbers stay different. Letters of every script are kept."""
-    text = unicodedata.normalize("NFKC", value).casefold().strip()
-    kept: list[str] = []
-    for index, char in enumerate(text):
-        category = unicodedata.category(char)
-        if char.isspace() or category[0] == "Z" or category == "Cf":
-            continue
-        if category[0] == "P":
-            between_digits = 0 < index < len(text) - 1 and text[index - 1].isdigit() and text[index + 1].isdigit()
-            leading_sign = index == 0 and char == "-" and len(text) > 1 and text[1].isdigit()
-            if not (between_digits or leading_sign):
-                continue
-        kept.append(char)
-    return "".join(kept)
 
 
 @register_rule
@@ -310,14 +309,12 @@ class AssertFieldEqual(Rule):
 
     left: FieldRef
     right: FieldRef | None = None
-    value: str | int | float | None = None
+    value: str | None = None
 
     @field_validator("value", mode="before")
     @classmethod
-    def _not_bool(cls, value: Any) -> Any:
-        if isinstance(value, bool):  # YAML yes/no: almost always a mistake
-            raise ValueError("value must be a string or a number, not a boolean")  # noqa: TRY004
-        return value
+    def _text_or_number(cls, value: Any) -> Any:
+        return value if value is None or isinstance(value, str) else _constant_text(value)
 
     @model_validator(mode="after")
     def _one_right_side(self) -> AssertFieldEqual:
@@ -329,7 +326,7 @@ class AssertFieldEqual(Rule):
         refs = (self.left,) if self.right is None else (self.left, self.right)
         evidence = ctx.field_evidence(*refs)
         left = ctx.field(self.left)
-        right = ctx.field(self.right) if self.right is not None else str(self.value)
+        right = ctx.field(self.right) if self.right is not None else self.value
         label = self.right if self.right is not None else "the required value"
         if left is None or right is None:
             missing = ", ".join(ref for ref, found in ((self.left, left), (self.right, right)) if ref and found is None)
@@ -339,13 +336,14 @@ class AssertFieldEqual(Rule):
         return None
 
 
-COMPARE_OPERATORS: dict[str, Any] = {
-    "<": lambda a, b: a < b,
-    "<=": lambda a, b: a <= b,
-    ">": lambda a, b: a > b,
-    ">=": lambda a, b: a >= b,
-    "==": lambda a, b: a == b,
-    "!=": lambda a, b: a != b,
+CompareOperator = Literal["<", "<=", ">", ">=", "==", "!="]
+COMPARE_OPERATORS: dict[str, Callable[[Decimal, Decimal], bool]] = {
+    "<": operator.lt,
+    "<=": operator.le,
+    ">": operator.gt,
+    ">=": operator.ge,
+    "==": operator.eq,
+    "!=": operator.ne,
 }
 
 
@@ -362,9 +360,14 @@ class AssertCompare(Rule):
     rule_name: ClassVar[str] = "assert_compare"
 
     left: FieldRef
-    op: Literal["<", "<=", ">", ">=", "==", "!="]
+    op: CompareOperator
     right: FieldRef | None = None
-    value: float | None = Field(default=None, allow_inf_nan=False)
+    value: Decimal | None = Field(default=None, allow_inf_nan=False)
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _number(cls, value: Any) -> Any:
+        return value if value is None or isinstance(value, str) else _number_constant(value)
 
     @model_validator(mode="after")
     def _one_right_side(self) -> AssertCompare:
@@ -377,9 +380,13 @@ class AssertCompare(Rule):
         evidence = ctx.field_evidence(*refs)
         left_text = ctx.field(self.left)
         right_text = ctx.field(self.right) if self.right is not None else None
-        right_label = self.right if self.right is not None else _format_number(self.value)
+        # Exactly one of value and right is set (_one_right_side).
+        right_number: Decimal | None
+        if self.value is not None:
+            right_label, right_number = _format_number(self.value), self.value
+        else:
+            right_label, right_number = str(self.right), parse_number(right_text) if right_text else None
         left_number = parse_number(left_text) if left_text is not None else None
-        right_number = self.value if self.right is None else (parse_number(right_text) if right_text else None)
         if left_number is None or right_number is None:
             return RuleFailure(
                 f"Blocked action because {self.left} {self.op} {right_label} could not be checked: "
@@ -395,10 +402,23 @@ class AssertCompare(Rule):
         return None
 
 
-def _format_number(value: float | None) -> str:
-    if value is None:
-        return "None"
-    return f"{value:,.0f}" if value.is_integer() else f"{value:,}"
+def _number_constant(value: Any) -> Decimal:
+    """A number from the policy file, exactly; a boolean (YAML yes/no) or non-finite number is refused."""
+    if isinstance(value, bool):
+        raise ValueError("value must be a number, not a boolean")  # noqa: TRY004 - Pydantic needs ValueError
+    number = parse_number(value) if isinstance(value, (int, float, Decimal)) else None
+    if number is None:
+        raise ValueError(f"value must be a finite number, not {value!r}")
+    return number
+
+
+def _constant_text(value: Any) -> str:
+    """A constant from the policy file as text; a number without exponent ("1e20" is 100000000000000000000)."""
+    return format(_number_constant(value), "f")
+
+
+def _format_number(value: Decimal) -> str:
+    return f"{value:,f}"
 
 
 class FileRestriction(Rule):
@@ -510,12 +530,13 @@ class RestrictDownloads(FileRestriction):
         if self.url_pattern is not None and re.search(self.url_pattern, url) is None:
             return f"{url} does not match {self.url_pattern}"
         if self.max_downloads is not None:
-            if not isinstance(count, int) or isinstance(count, bool):
+            known = as_int(count)
+            if known is None:
                 return (
                     f"the download count is unknown ({count!r}); max_downloads {self.max_downloads} cannot be checked"
                 )
-            if count > self.max_downloads:
-                return f"download {count} exceeds max_downloads {self.max_downloads}"
+            if known > self.max_downloads:
+                return f"download {known} exceeds max_downloads {self.max_downloads}"
         return None
 
 

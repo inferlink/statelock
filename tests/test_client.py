@@ -19,16 +19,17 @@ from playwright.async_api import Error as PlaywrightError
 
 from statelock.client import (
     SessionUrl,
-    SessionUrlError,
-    StatelockConnection,
+    StatelockClientError,
     StatelockPolicyViolationError,
     create_session_url,
     statelock_guard,
     statelock_guard_sync,
     transfer,
 )
+from statelock.client.connection import HeaderConnection
 from statelock.client.files import run
-from statelock.client.sync import run as run_sync
+from statelock.client.files_sync import run as run_sync
+from statelock.client.violations import complete_violation
 from statelock.wire import VIOLATION_MARKER
 
 
@@ -81,13 +82,13 @@ RECORDED = {
 
 def test_connection_headers_for_frameworks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("STATELOCK_API_KEY", "slk_env")
-    conn = StatelockConnection("ws://proxy/statelock", "agent", session_id="s-1")
+    conn = HeaderConnection("ws://proxy/statelock", "agent", session_id="s-1")
     assert conn.headers == {
         "x-statelock-agent-id": "agent",
         "x-statelock-session-id": "s-1",
         "Authorization": "Bearer slk_env",
     }
-    assert "Authorization" not in StatelockConnection("ws://p", "agent", api_key="").headers
+    assert "Authorization" not in HeaderConnection("ws://p", "agent", api_key="").headers
     with pytest.raises(RuntimeError, match="not connected"):
         _ = conn.browser
     browser = object()
@@ -95,14 +96,14 @@ def test_connection_headers_for_frameworks(monkeypatch: pytest.MonkeyPatch) -> N
     assert conn.browser is browser
 
 
-def test_an_unreachable_server_is_a_session_url_error() -> None:
+def test_an_unreachable_server_is_a_client_error() -> None:
     with socket.socket() as sock:  # a free port nothing listens on
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    with pytest.raises(SessionUrlError, match="could not reach Statelock") as raised:
+    with pytest.raises(StatelockClientError, match="could not reach Statelock") as raised:
         create_session_url(server_url=f"http://127.0.0.1:{port}", api_key="k")
     assert raised.value.status is None
-    with pytest.raises(SessionUrlError, match="could not reach Statelock"):
+    with pytest.raises(StatelockClientError, match="could not reach Statelock"):
         SessionUrl("s", "a", f"http://127.0.0.1:{port}/sessions/x", "ws://x", "t").violation()
 
 
@@ -128,10 +129,25 @@ def test_violation_lookup_uses_the_sessions_key_and_404_means_none(
     ]
 
 
+def test_an_empty_key_means_no_key_everywhere(statelock: _Statelock, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty key sends no key and never falls back to STATELOCK_API_KEY, for session URLs and header connections."""
+    monkeypatch.setenv("STATELOCK_API_KEY", "slk_env")
+    assert statelock.session(api_key="").violation() is None
+    conn = HeaderConnection(statelock.url.replace("http", "ws") + "/statelock", "a", "s-1", api_key="")
+
+    async def guarded() -> None:
+        async with conn.guard():
+            raise PlaywrightError("Target page, context or browser has been closed")
+
+    with pytest.raises(PlaywrightError):
+        asyncio.run(guarded())
+    assert [auth for _, auth in statelock.requests] == [None, None]
+
+
 @pytest.mark.parametrize("status", [401, 403, 500])
 def test_a_refused_lookup_is_an_error_not_no_violation(statelock: _Statelock, status: int) -> None:
     statelock.answers["/violations/s-1"] = (status, {"detail": "no"})
-    with pytest.raises(SessionUrlError, match=f"refused the request \\({status}\\)") as raised:
+    with pytest.raises(StatelockClientError, match=f"refused the request \\({status}\\)") as raised:
         statelock.session().violation()
     assert raised.value.status == status
 
@@ -175,13 +191,13 @@ def test_without_a_record_the_marker_in_the_error_is_used(statelock: _Statelock)
 
 def test_guards_raise_when_statelock_refuses_the_lookup(statelock: _Statelock) -> None:
     statelock.answers["/violations/s-1"] = (401, {"detail": "invalid key"})
-    with pytest.raises(SessionUrlError, match="401"), statelock_guard_sync(statelock.url, "s-1", "wrong"):
+    with pytest.raises(StatelockClientError, match="401"), statelock_guard_sync(statelock.url, "s-1", "wrong"):
         raise PlaywrightError("Target page, context or browser has been closed")
 
 
 def test_guards_complete_an_sdk_raised_violation(statelock: _Statelock) -> None:
     """A blocked download raises a violation with only rule and reason: the guard adds the record."""
-    blocked = StatelockPolicyViolationError({"rule": "download", "reason": "tool.exe", "session_id": "s-1"})
+    blocked = StatelockPolicyViolationError({"rule": None, "reason": "tool.exe", "session_id": "s-1"})
 
     async def guarded() -> None:
         async with statelock_guard(statelock.url, None, "k"):
@@ -189,7 +205,7 @@ def test_guards_complete_an_sdk_raised_violation(statelock: _Statelock) -> None:
 
     with pytest.raises(StatelockPolicyViolationError) as raised:
         asyncio.run(guarded())
-    assert raised.value.rule == "download" and raised.value.__cause__ is None  # no record yet: unchanged
+    assert raised.value is blocked and raised.value.__cause__ is None  # no record yet: unchanged
     statelock.answers["/violations/s-1"] = (200, RECORDED)
     with pytest.raises(StatelockPolicyViolationError) as raised:
         asyncio.run(guarded())
@@ -197,6 +213,67 @@ def test_guards_complete_an_sdk_raised_violation(statelock: _Statelock) -> None:
     with pytest.raises(StatelockPolicyViolationError) as raised, statelock_guard_sync(statelock.url, "s-1", "k"):
         raise blocked
     assert raised.value.reason == RECORDED["reason"]
+
+
+def test_a_failed_lookup_keeps_the_known_violation(statelock: _Statelock) -> None:
+    """A blocked download is the reason the session ended: a lookup error must not replace it."""
+    blocked = StatelockPolicyViolationError({"rule": "restrict_downloads", "reason": "tool.exe", "session_id": "s-1"})
+    statelock.answers["/violations/s-1"] = (500, {"detail": "down"})
+
+    async def guarded() -> None:
+        async with statelock_guard(statelock.url, "s-1", "k"):
+            raise blocked
+
+    with pytest.raises(StatelockPolicyViolationError) as raised:
+        asyncio.run(guarded())
+    assert raised.value is blocked
+    with pytest.raises(StatelockPolicyViolationError) as raised, statelock_guard_sync(statelock.url, "s-1", "k"):
+        raise blocked
+    assert raised.value is blocked
+    assert len(statelock.requests) == 2
+
+
+def test_a_recorded_violation_is_not_looked_up_again(statelock: _Statelock) -> None:
+    statelock.answers["/violations/s-1"] = (200, RECORDED)
+    completed = complete_violation(StatelockPolicyViolationError({"reason": "x"}), statelock.url, "s-1", "k")
+    assert completed.recorded and completed.rule == "restrict_downloads"
+    assert len(statelock.requests) == 1
+    # Nested guards: a completed violation, a found record.
+    for raised_error in (completed, statelock.session().violation()):
+        with (
+            pytest.raises(StatelockPolicyViolationError) as raised,
+            statelock_guard_sync(statelock.url, "s-1", "k"),
+            statelock_guard_sync(statelock.url, "s-1", "k"),
+        ):
+            raise raised_error  # type: ignore[misc]
+        assert raised.value is raised_error
+    assert len(statelock.requests) == 2  # only SessionUrl.violation() asked
+
+
+def test_guard_found_violations_are_recorded(statelock: _Statelock) -> None:
+    statelock.answers["/violations/s-1"] = (200, RECORDED)
+    with (
+        pytest.raises(StatelockPolicyViolationError) as raised,
+        statelock_guard_sync(statelock.url, "s-1", "k"),
+        statelock_guard_sync(statelock.url, "s-1", "k"),
+    ):
+        raise PlaywrightError("Target page, context or browser has been closed")
+    assert raised.value.recorded and len(statelock.requests) == 1
+
+
+def test_connection_guard_takes_an_api_key(statelock: _Statelock, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("STATELOCK_API_KEY", raising=False)
+    statelock.answers["/violations/s-1"] = (200, RECORDED)
+    conn = HeaderConnection(statelock.url.replace("http", "ws") + "/statelock", "a", "s-1", api_key="slk_conn")
+
+    async def guarded(api_key: str | None) -> None:
+        async with conn.guard(api_key):
+            raise PlaywrightError("Target page, context or browser has been closed")
+
+    for api_key in (None, "slk_other"):
+        with pytest.raises(StatelockPolicyViolationError):
+            asyncio.run(guarded(api_key))
+    assert [auth for _, auth in statelock.requests] == ["Bearer slk_conn", "Bearer slk_other"]
 
 
 # Protocol drivers ----------------------------------------------------------------------------
@@ -253,7 +330,7 @@ def test_upload_options() -> None:
         transfer.upload_timeout({"force": True})
 
 
-def test_a_downloads_temporary_file_stays_in_the_temporary_folder(tmp_path: Path) -> None:
+def test_a_downloads_temporary_file_stays_in_the_temporary_folder() -> None:
     path = transfer.temporary_path("../../etc/evil.pdf")
     try:
         assert path.parent == Path(transfer.tempfile.gettempdir()) and path.name.endswith("-evil.pdf")

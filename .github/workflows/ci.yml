@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Every job that runs browser tests installs Chromium: without it they fail, not skip.
+  STATELOCK_REQUIRE_BROWSER: "1"
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -42,7 +46,7 @@ jobs:
           pip install -e ".[dev]"
           python -m playwright install --with-deps chromium
       - name: Test
-        run: python -m pytest -q
+        run: python -m pytest -q -rs
 
   # The integration tests that are skipped without their extras: browser-use, LangChain
   # and the Stagehand OJS example. The CrewAI conversion test stays skipped: crewai's

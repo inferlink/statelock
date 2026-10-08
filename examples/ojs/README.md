@@ -9,15 +9,16 @@ This is a Stagehand agent for Open Journal Systems (OJS 3.x). It logs in as an e
 
 Afterwards it declines the papers that a decisions file marks for rejection. Every click, key press and download goes through Statelock, which checks it against the policy in `ojs_policy.yaml` and records it as evidence.
 
-The agent is ordinary Stagehand and Playwright code. The only Statelock code is three lines in `main()`, and a placeholder where the password would be:
+The agent is ordinary Stagehand and Playwright code. The only Statelock code is three lines in `open_session()` and `run_governed()`, and a placeholder where the password would be:
 
 ```python
-statelock.client.install()          # Playwright's own uploads and downloads go through Statelock
+# open_session()
 session = create_session_url(saved_session="ojs-editor", save_session=True)   # a one-time browser URL, logged in if a run saved the login
+# run_governed()
+statelock.client.install()          # Playwright's own uploads and downloads go through Statelock
 stagehand = Stagehand(StagehandConfig(env="LOCAL", local_browser_launch_options={"cdp_url": session.cdp_url}, ...))
-...
 async with session.guard():         # optional: a violation raises StatelockPolicyViolationError
-...
+    ...
 await password_field.fill("{{secret:ojs_password}}")   # Statelock types the real password
 ```
 
@@ -53,10 +54,10 @@ To start over, delete the saved login: `STATELOCK_API_KEY=slk_dev_ojs_screening_
 
 ### With Docker (no local install)
 
-`compose.dev.yaml` runs the mock journal (`ojs-mock`) and the agent in containers next to the proxy. Each command starts what it needs:
+`compose.dev.yaml` runs the mock journal (`ojs-mock`) and the agent in containers next to the proxy. Create `.env` first (`cp .env.example .env`; `compose.yaml` reads it). The commands below assume `COMPOSE_FILE=compose.yaml:compose.dev.yaml` in `.env` (see `.env.example`); otherwise add `-f compose.yaml -f compose.dev.yaml` to each. Each command starts what it needs:
 
 ```bash
-docker compose up -d                              # Statelock on localhost:8010
+docker compose up -d --build                      # Statelock on localhost:8010
 docker compose --profile ojs-agent run --rm ojs-agent                 # dry run: screens 101-103, fills and cancels the decline of 102
 docker compose --profile ojs-record-agent run --rm ojs-record-agent          # records the decline of 102 (in the mock)
 docker compose --profile ojs-block-agent run --rm ojs-block-agent           # clicks "Send to Review": blocked, the session ends (exit 2)
@@ -85,7 +86,7 @@ OJS_RECORD_DECISIONS=1 python examples/ojs/ojs_agent.py      # records the decli
 
 The agent and the proxy's `ojs_decision` rule read the same decisions: a decline the proxy's copy does not have, or with another email, is blocked.
 
-The page URL must work for Chromium, which runs in the Statelock container. The development secret allows login only at `http://ojs-mock:8081/index.php/journal/login`, so the mock uses that Compose hostname. To run the mock on the host instead, change `url_contains` in `docker/dev-secrets.yaml` to `http://host.docker.internal:8081/index.php/journal/login`, restart the proxy, and use that host in `OJS_BASE_URL`. For a real journal, configure its URL and secret scope explicitly.
+The page URL must work for Chromium, which runs in the Statelock container. The development secret allows login only at `http://ojs-mock:8081/index.php/journal/login`, so the mock uses that Compose hostname. To run the mock on the host instead, change `url_contains` in `docker/dev-secrets.yaml` to `http://host.docker.internal:8081/index.php/journal/login`, restart the proxy, and use that host in `OJS_BASE_URL`. On Linux, Docker defines `host.docker.internal` only when asked: add `extra_hosts: ["host.docker.internal:host-gateway"]` to the `statelock` service first. The mock must listen on an address the container can reach (`MOCK_OJS_HOST=0.0.0.0`). For a real journal, configure its URL and secret scope explicitly.
 
 Results go to `ojs-output/results.json`, with the manuscripts beside it. The evidence is in the Statelock artifacts for the session.
 
@@ -113,7 +114,7 @@ To make each recorded rejection wait for an editor, add this rule:
       - prohibit_click_text: {values: [Record Editorial Decision], on_fail: review}
 ```
 
-Each rejection then pauses until a reviewer approves or denies it at `/review`. Raise the agent's action timeout above `STATELOCK_REVIEW_TIMEOUT`; the agent sets it to 360 s.
+Each rejection then pauses until a reviewer approves or denies it at `/review`. Raise the agent's action timeout above `STATELOCK_REVIEW_TIMEOUT`: `OJS_ACTION_TIMEOUT` (seconds, default 360).
 
 ## Tests
 
