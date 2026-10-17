@@ -9,18 +9,20 @@ from typing import Any
 from statelock.audit.redaction import REDACTED
 
 SENSITIVE_HEADERS = {"cookie", "set-cookie", "authorization", "proxy-authorization"}
-COOKIE_DETAIL_KEYS = {"associatedCookies", "blockedCookies", "exemptedCookies", "cookie"}
+# Cookie lists stay lists: CDP clients such as Playwright iterate them.
+COOKIE_LISTS = {"associatedCookies", "blockedCookies", "exemptedCookies"}
+# Optional raw header text is dropped rather than nulled, as CDP omits it when absent.
+RAW_HEADER_TEXT = {"headersText", "requestHeadersText", "responseHeadersText"}
 
 
 def _clean(value: Any, key: str = "") -> Any:
-    if key in COOKIE_DETAIL_KEYS:
-        return None
+    if key in COOKIE_LISTS:
+        return []
+    # Header values must stay strings: Playwright splits every value and fails on null.
     if key.casefold() in SENSITIVE_HEADERS:
         return REDACTED
-    if key in {"headersText", "requestHeadersText", "responseHeadersText"}:
-        return None
     if isinstance(value, dict):
-        return {name: _clean(item, name) for name, item in value.items()}
+        return {name: _clean(item, name) for name, item in value.items() if name not in RAW_HEADER_TEXT}
     if isinstance(value, list):
         return [_clean(item) for item in value]
     return value

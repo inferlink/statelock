@@ -76,6 +76,39 @@ def test_network_events_hide_cookies_and_auth_headers() -> None:
     assert filter_network_message(unchanged) == unchanged
 
 
+def test_network_events_keep_cdp_types_for_lowercase_http2_headers() -> None:
+    # HTTP/2 extra-info events carry lowercase header names; Playwright splits every value.
+    request = {
+        "method": "Network.requestWillBeSentExtraInfo",
+        "params": {
+            "requestId": "1",
+            "headers": {"cookie": "sid=secret", ":authority": "example.test"},
+            "associatedCookies": [{"blockedReasons": [], "cookie": {"name": "sid", "value": "secret"}}],
+        },
+    }
+    response = {
+        "method": "Network.responseReceivedExtraInfo",
+        "params": {
+            "requestId": "1",
+            "headers": {"set-cookie": "sid=secret", "content-type": "text/html"},
+            "blockedCookies": [{"blockedReasons": ["SecureOnly"], "cookieLine": "sid=secret"}],
+            "exemptedCookies": [{"exemptionReason": "None", "cookie": {"value": "secret"}}],
+            "headersText": "HTTP/1.1 200 OK\r\nset-cookie: sid=secret",
+            "statusCode": 200,
+        },
+    }
+    for event in (request, response):
+        cleaned = json.loads(filter_network_message(json.dumps(event)))
+        assert "secret" not in json.dumps(cleaned)
+        params = cleaned["params"]
+        assert all(isinstance(value, str) for value in params["headers"].values())
+        assert "headersText" not in params
+        for key in ("associatedCookies", "blockedCookies", "exemptedCookies"):
+            if key in event["params"]:
+                assert params[key] == []
+    assert json.loads(filter_network_message(json.dumps(request)))["params"]["headers"][":authority"] == "example.test"
+
+
 def _created(context_id: int, name: str, session: str, unique: str = "") -> str:
     context = {"id": context_id, "name": name, "uniqueId": unique or f"u{context_id}", "auxData": {"frameId": "T1"}}
     return json.dumps(
