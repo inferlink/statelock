@@ -629,6 +629,7 @@ src/statelock/
   settings.py, plugins.py, events.py, services.py, registry.py, wire.py, fileio.py
 tests/         unit tests; browser tests (test_browser_*.py, skipped without Chromium unless STATELOCK_REQUIRE_BROWSER=1);
                helpers (conftest.py, helpers.py, fakes.py, browser_support.py, ojs_support.py); fixtures/perception
+tools/policy-studio/  Policy Studio: a local UI that drafts a policy from notes on a Chrome recording (LiteLLM)
 examples/      rogue_agent.py, finance_agent.py, portal_agent.py; ojs/ (Stagehand OJS agent, mock OJS site, its policy and custom rule);
                ojs-ts/ (the OJS agent in TypeScript on Stagehand v3)
 js/            @statelock/client: the JavaScript/TypeScript SDK; src/ index.ts, sessions.ts, violations.ts, cdp.ts,
@@ -636,7 +637,8 @@ js/            @statelock/client: the JavaScript/TypeScript SDK; src/ index.ts, 
 policies/      default.yaml
 docker/        Dockerfile (targets: runtime, dev, ojs), seccomp profile, dev keys, dev secrets, README-sandbox.md
 compose.yaml   the proxy; compose.dev.yaml adds demos, demo agents, tests and the vlm profile
-.github/workflows/  ci.yml (lint, types, tests, extras, JS), dco.yml (sign-off check), release.yml (PyPI and GitHub release)
+               compose.dev.yaml's policy-studio profile: Policy Studio alone, on its own network, at 127.0.0.1:8765
+.github/workflows/  ci.yml (lint, types, tests, extras, Policy Studio, JS), dco.yml (sign-off check), release.yml (PyPI and GitHub release)
 ```
 
 ## Development
