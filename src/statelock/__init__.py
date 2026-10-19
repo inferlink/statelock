@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
 """Statelock: governed browser actions for AI agents."""
 
-__version__ = "0.1.1"  # the package version: pyproject.toml reads it from here
+__version__ = "0.1.2"  # the package version: pyproject.toml reads it from here

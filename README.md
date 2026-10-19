@@ -560,7 +560,7 @@ All settings are `STATELOCK_*` environment variables (`statelock/settings.py`). 
 | `STATELOCK_AGENT_SCRIPT_GRACE` | 0.5 | Seconds after agent code returns that a click it started still counts as the agent's (and is replayed). |
 | `STATELOCK_REPLAY_WAIT` | 10 | Seconds the agent's next command waits, at most, for a replayed click to finish. |
 | `STATELOCK_CHROMIUM_SANDBOX` | `false` (`1` in `compose.yaml`) | Chromium sandbox. It needs a non-root user and a seccomp profile that allows user namespaces; `compose.yaml` provides both (see [docker/README-sandbox.md](https://github.com/inferlink/statelock/blob/main/docker/README-sandbox.md)). If the sandbox cannot start, sessions are refused. |
-| `STATELOCK_CHROMIUM_START_TIMEOUT` | 10 | Seconds Chromium has to start and answer on its CDP pipe; otherwise the session is refused. |
+| `STATELOCK_CHROMIUM_START_TIMEOUT` | 30 | Seconds Chromium has to start and answer on its CDP pipe; otherwise the session is refused. |
 | `STATELOCK_CAPTURE_TIMEOUT` | 2.5 | Seconds a state capture may take before the action is blocked. |
 | `STATELOCK_POST_CAPTURE_SETTLE` | 0.2 | Seconds to wait after a commit action before capturing the page for post-conditions. |
 | `STATELOCK_HELD_RESPONSE_TIMEOUT` | 10 | Seconds to wait for the browser's response to a held commit action. |

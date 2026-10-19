@@ -66,7 +66,7 @@ class Settings(BaseSettings):
 
     # Chromium.
     chromium_sandbox: bool = False  # the sandbox needs a non-root user and a permissive seccomp profile
-    chromium_start_timeout: float = Field(default=10.0, gt=0)  # seconds for Chromium to answer on its CDP pipe
+    chromium_start_timeout: float = Field(default=30.0, gt=0)  # seconds for Chromium to answer on its CDP pipe
 
     # Timing (seconds).
     capture_timeout: float = Field(default=2.5, gt=0)

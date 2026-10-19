@@ -35,8 +35,9 @@ from statelock.proxy.connection import DEFAULT_COMMAND_TIMEOUT, CdpConnection, C
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_START_TIMEOUT = 10.0
+DEFAULT_START_TIMEOUT = 30.0  # a first launch on macOS waits for the signature check
 STOP_TIMEOUT = 5.0
+WAIT_POLL_INTERVAL = 0.05  # seconds between checks while waiting for Chromium to exit
 EXIT_CODE_WAIT = 1.0  # after the pipe closed during startup: for the exit code and the last stderr
 CLEANUP_ATTEMPTS = 10
 CLEANUP_INTERVAL = 0.2
@@ -102,12 +103,36 @@ def chromium_environment(environ: Mapping[str, str] | None = None) -> dict[str, 
 # Process lifetime ------------------------------------------------------------------------
 
 
-def _signal_group(process: asyncio.subprocess.Process, signum: int) -> None:
+class ChromiumProcess:
+    """Chromium's main process, started by ``subprocess.Popen``.
+
+    Not the event loop's own spawn: uvloop (uvicorn's loop when installed) uses
+    posix_spawn on macOS, which skips ``preexec_fn``, so the CDP pipe never reached
+    fds 3 and 4. Popen forks, runs it in the child, then execs, with any loop.
+    """
+
+    def __init__(self, popen: subprocess.Popen[bytes], stderr: asyncio.StreamReader) -> None:
+        self._popen = popen
+        self.pid = popen.pid
+        self.stderr = stderr
+
+    @property
+    def returncode(self) -> int | None:
+        return self._popen.poll()
+
+    async def wait(self) -> int:
+        # Polled: a thread per wait could fill the default executor with many sessions.
+        while (code := self._popen.poll()) is None:  # noqa: ASYNC110
+            await asyncio.sleep(WAIT_POLL_INTERVAL)
+        return code
+
+
+def _signal_group(process: ChromiumProcess, signum: int) -> None:
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(process.pid, signum)  # the process leads its own group (start_new_session)
 
 
-async def stop_process(process: asyncio.subprocess.Process, timeout: float = STOP_TIMEOUT) -> None:
+async def stop_process(process: ChromiumProcess, timeout: float = STOP_TIMEOUT) -> None:
     """Stop Chromium and its helpers: SIGTERM to its process group, then SIGKILL to the
     group after ``timeout`` seconds, once it has exited, or when this is cancelled."""
     try:
@@ -230,7 +255,7 @@ def _unheld(path: Path) -> bool:
 class GovernedBrowser:
     """A running Chromium: Statelock's CDP connection and the agent's channel on its pipe."""
 
-    process: asyncio.subprocess.Process
+    process: ChromiumProcess
     multiplexer: CdpMultiplexer
     connection: CdpConnection
     profile: _Profile
@@ -250,7 +275,7 @@ class GovernedBrowser:
 
 
 async def _teardown(
-    process: asyncio.subprocess.Process | None,
+    process: ChromiumProcess | None,
     multiplexer: CdpMultiplexer | None,
     connection: CdpConnection | None,
     stderr_reader: asyncio.Task[None] | None,
@@ -335,13 +360,12 @@ class ChromiumCdpLauncher:
             args.insert(1, "--no-sandbox")
 
         stderr = _StderrTail()
-        process: asyncio.subprocess.Process | None = None
+        process: ChromiumProcess | None = None
         stderr_reader: asyncio.Task[None] | None = None
         multiplexer: CdpMultiplexer | None = None
         connection: CdpConnection | None = None
         try:
             process, read_fd, write_fd = await self._spawn(args)
-            assert process.stderr is not None  # noqa: S101 - stderr=PIPE
             stderr_reader = asyncio.create_task(stderr.drain(process.stderr))
             multiplexer = CdpMultiplexer(await CdpPipe.open(read_fd, write_fd))
             multiplexer.start()
@@ -362,7 +386,7 @@ class ChromiumCdpLauncher:
             process, multiplexer, connection, profile, stderr, stderr_reader, stop_timeout=self.stop_timeout
         )
 
-    async def _spawn(self, args: list[str]) -> tuple[asyncio.subprocess.Process, int, int]:
+    async def _spawn(self, args: list[str]) -> tuple[ChromiumProcess, int, int]:
         """Start Chromium; returns it and our ends of its CDP pipe (read, write)."""
         to_chromium = os.pipe()
         from_chromium = os.pipe()
@@ -372,15 +396,15 @@ class ChromiumCdpLauncher:
         try:
             # close_fds=False: fds 3 and 4 are set up in the child, after the point where
             # close_fds would close them. Every other fd the proxy opens is close-on-exec.
-            process = await asyncio.create_subprocess_exec(
-                *args,
+            popen = subprocess.Popen(  # noqa: S603, ASYNC220 - Playwright's Chromium; fork and exec only
+                args,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 env=chromium_environment(),
                 start_new_session=True,
                 close_fds=False,
-                preexec_fn=_child_setup(child_read, child_write),
+                preexec_fn=_child_setup(child_read, child_write),  # noqa: PLW1509 - only dup2 and prctl
             )
         except BaseException:
             for fd in (*to_chromium, *from_chromium):
@@ -391,10 +415,22 @@ class ChromiumCdpLauncher:
             os.close(child_write)
         os.close(to_chromium[0])
         os.close(from_chromium[1])
-        return process, from_chromium[0], to_chromium[1]
+        try:
+            stderr = asyncio.StreamReader()
+            assert popen.stderr is not None  # noqa: S101 - stderr=PIPE
+            await asyncio.get_running_loop().connect_read_pipe(
+                lambda: asyncio.StreamReaderProtocol(stderr), popen.stderr
+            )
+        except BaseException:
+            popen.kill()
+            popen.wait()
+            os.close(from_chromium[0])
+            os.close(to_chromium[1])
+            raise
+        return ChromiumProcess(popen, stderr), from_chromium[0], to_chromium[1]
 
     async def _wait_until_ready(
-        self, connection: CdpConnection, process: asyncio.subprocess.Process, stderr_reader: asyncio.Task[None]
+        self, connection: CdpConnection, process: ChromiumProcess, stderr_reader: asyncio.Task[None]
     ) -> None:
         """Chromium answers a first command within start_timeout, or the launch fails."""
         try:
