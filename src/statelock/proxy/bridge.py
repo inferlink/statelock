@@ -502,7 +502,7 @@ class CdpBridge:
             for message_id, cdp_session_id in browser.multiplexer.unanswered(session.agent_channel):
                 request = {"id": message_id, **({"sessionId": cdp_session_id} if cdp_session_id else {})}
                 await session.respond(request, statelock_error(STALLED_CLOSE_REASON))
-            raise BrowserStalledError(await _stall_diagnostics(browser))
+            raise BrowserStalledError(f"Chromium stopped loading pages. {await browser.diagnose()}")
         for task in done:
             task.result()
 
@@ -658,17 +658,6 @@ class BrowserStalledError(Exception):
 # Later page loads in that browser stall too (seen in CI), so the session ends: the agent
 # starts a new one, with a new browser.
 STALLED_CLOSE_REASON = "Chromium stopped loading pages; start a new Statelock session"
-
-
-async def _stall_diagnostics(browser: GovernedBrowser) -> str:
-    """What the logs need to tell why Chromium stalled: its processes and its stderr."""
-    try:
-        info = await browser.connection.send("SystemInfo.getProcessInfo")
-        processes = ", ".join(sorted(str(p.get("type")) for p in info.get("processInfo", [])))
-    except CdpError as error:
-        processes = f"unavailable ({error})"
-    tail = browser.stderr.text() or "(empty)"
-    return f"Chromium stopped loading pages. Processes: {processes}. Chromium stderr: {tail}"
 
 
 @contextlib.contextmanager

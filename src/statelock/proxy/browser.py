@@ -25,10 +25,11 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, BinaryIO
+from typing import IO, Any, BinaryIO
 
 from playwright.async_api import async_playwright
 
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_START_TIMEOUT = 30.0  # a first launch on macOS waits for the signature check
 STOP_TIMEOUT = 5.0
 WAIT_POLL_INTERVAL = 0.05  # seconds between checks while waiting for Chromium to exit
+DIAGNOSE_TIMEOUT = 3.0  # seconds for each probe of a misbehaving browser
 EXIT_CODE_WAIT = 1.0  # after the pipe closed during startup: for the exit code and the last stderr
 CLEANUP_ATTEMPTS = 10
 CLEANUP_INTERVAL = 0.2
@@ -148,6 +150,22 @@ async def stop_process(process: ChromiumProcess, timeout: float = STOP_TIMEOUT) 
         _signal_group(process, signal.SIGKILL)  # also any helper that outlived the main process
         if process.returncode is None:
             await asyncio.shield(process.wait())
+
+
+def _wait_states(pid: Any) -> str:
+    """Linux: the states and kernel wait channels of a process's threads, most common first."""
+    task_dir = Path(f"/proc/{pid}/task")
+    if not isinstance(pid, int) or not task_dir.is_dir():
+        return ""
+    counts: Counter[str] = Counter()
+    for task in task_dir.iterdir():
+        try:
+            state = (task / "stat").read_text().rsplit(") ", 1)[1][0]
+            wchan = (task / "wchan").read_text().strip() or "-"
+        except (OSError, IndexError):
+            continue
+        counts[f"{state}:{wchan}"] += 1
+    return " [" + ", ".join(f"{name}x{n}" for name, n in counts.most_common(4)) + "]"
 
 
 def _child_setup(read_fd: int, write_fd: int) -> Callable[[], None]:
@@ -278,6 +296,26 @@ class GovernedBrowser:
     stderr: _StderrTail
     stderr_reader: asyncio.Task[None]
     stop_timeout: float = STOP_TIMEOUT
+
+    async def diagnose(self) -> str:
+        """For the log when Chromium misbehaves: its processes (with CPU time and, on Linux,
+        what their threads wait on), whether its network process answers, and its stderr."""
+        try:
+            info = await self.connection.send("SystemInfo.getProcessInfo")
+            processes = "; ".join(
+                f"{p.get('type')} pid={p.get('id')} cpu={float(p.get('cpuTime') or 0):.1f}s{_wait_states(p.get('id'))}"
+                for p in info.get("processInfo", [])
+            )
+        except CdpError as error:
+            processes = f"unavailable ({error})"
+        try:
+            # Cookie reads are answered by the network process.
+            await self.connection.send("Storage.getCookies", timeout=DIAGNOSE_TIMEOUT)
+            network = "answers"
+        except CdpError as error:
+            network = f"does not answer ({error})"
+        tail = self.stderr.text() or "(empty)"
+        return f"Processes: {processes}. Network process: {network}. Chromium stderr: {tail}"
 
     async def close(self) -> None:
         await _teardown(

@@ -20,7 +20,8 @@ from statelock.proxy.bridge import STALLED_CLOSE_REASON  # noqa: E402
 from statelock.proxy.guard import DOCUMENT, PageGuard  # noqa: E402
 
 pytestmark = pytest.mark.browser
-STALL_TIMEOUT = 1.0
+# Long enough that a busy CI host pauses a page load in time; the injected stall never ends.
+STALL_TIMEOUT = 3.0
 
 
 @pytest.fixture(scope="module")

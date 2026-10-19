@@ -292,6 +292,9 @@ async def _first_load(page: Any, url: str) -> None:
         ) from error
 
 
+STALLED_SESSION_RETRIES = 2
+
+
 class _BrowserStalled(Exception):
     """Statelock ended the session at its first page load: Chromium stopped loading pages."""
 
@@ -311,11 +314,13 @@ async def _governed(
     Returns (session id, the steps' result or the StatelockPolicyViolationError).
 
     When Statelock ends the session at the first page load because Chromium stopped loading
-    pages (rare; seen in CI), the test starts a new session once, as an agent would."""
-    try:
-        return await _governed_once(server, agent, start, steps)
-    except _BrowserStalled:
-        return await _governed_once(server, agent, start, steps)
+    pages (rare; seen in CI), the test starts a new session, as an agent would."""
+    for _ in range(STALLED_SESSION_RETRIES):
+        try:
+            return await _governed_once(server, agent, start, steps)
+        except _BrowserStalled:
+            continue
+    return await _governed_once(server, agent, start, steps)
 
 
 async def _governed_once(
