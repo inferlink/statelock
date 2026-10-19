@@ -350,6 +350,7 @@ def _session(**components: Any) -> _Session:
             "scripts",
             "field_watcher",
             "replayer",
+            "browser_stalled",
         )
     }
     return _Session(**{**fields, **components})

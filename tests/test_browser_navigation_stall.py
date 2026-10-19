@@ -16,6 +16,7 @@ from browser_support import chromium_available, run_session, running_server, sit
 from fastapi import APIRouter  # noqa: E402
 from fastapi.responses import HTMLResponse  # noqa: E402
 
+from statelock.proxy.bridge import STALLED_CLOSE_REASON  # noqa: E402
 from statelock.proxy.guard import DOCUMENT, PageGuard  # noqa: E402
 
 pytestmark = pytest.mark.browser
@@ -56,22 +57,18 @@ def first_page_load_never_paused(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.usefixtures("first_page_load_never_paused")
-def test_a_stalled_page_load_fails_fast_and_a_retry_loads(stalling_server: dict[str, Any]) -> None:
+def test_a_stalled_page_load_ends_the_session_fast_and_a_new_session_loads(stalling_server: dict[str, Any]) -> None:
     async def steps(page: Any) -> Any:
         started = time.monotonic()
-        try:
+        with pytest.raises(playwright_api.Error) as caught:
             await page.goto(stalling_server["base"] + "/gov/form", timeout=30_000)
-        except playwright_api.Error as error:
-            failed = (str(error).splitlines()[0], time.monotonic() - started)
-        else:
-            failed = None
-        await page.goto(stalling_server["base"] + "/gov/form", timeout=30_000)
-        return failed, await page.title()
+        return str(caught.value), time.monotonic() - started
 
-    _, (failed, title) = run_session(stalling_server, "flow_agent", "", steps)
-    assert failed is not None, "the stalled load should have been stopped"
-    message, seconds = failed
-    assert seconds < 10, message
+    _, (error, seconds) = run_session(stalling_server, "flow_agent", "", steps)
+    assert STALLED_CLOSE_REASON in error
+    assert seconds < 10
+    # A new session has a new browser; this one's first page load is paused as usual.
+    _, title = run_session(stalling_server, "flow_agent", "/gov/form", lambda page: page.title())
     assert title == "Form"
 
 
@@ -83,3 +80,13 @@ def test_a_slow_site_is_not_mistaken_for_a_stalled_load(stalling_server: dict[st
 
     _, title = run_session(stalling_server, "flow_agent", "", steps)
     assert title == "Slow"
+
+
+@pytest.mark.usefixtures("first_page_load_never_paused")
+def test_the_browser_tests_start_a_new_session_when_the_first_load_stalls(
+    stalling_server: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    _, title = run_session(stalling_server, "flow_agent", "/gov/form", lambda page: page.title())
+    assert title == "Form"
+    # The proxy log says what Chromium was doing, for the next real occurrence.
+    assert any("Chromium stopped loading pages. Processes:" in r.getMessage() for r in caplog.records)

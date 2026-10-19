@@ -58,7 +58,7 @@ Verified against Chromium 141.0.7390.37 (Playwright 1.56.0).
 | `form.submit()`, or `form.requestSubmit()` outside a real click, Enter key or touch | Failed (`untrusted_form_submission`). |
 | Reading the page (`page.evaluate` without side effects) | Allowed. |
 
-Every page load and request in the table's scope waits for the guard's decision. Chromium has rarely started a page load without pausing it for the guard (seen on a session's first load): such a load never reaches the site, and Statelock stops it after `STATELOCK_NAVIGATION_STALL_TIMEOUT` (10 s), so the agent's navigation fails (`net::ERR_ABORTED`) instead of hanging.
+Every page load and request in the table's scope waits for the guard's decision. Chromium has rarely started a page load without pausing it for the guard (seen on a session's first load; later loads in that browser stalled too): such a load never reaches the site, and after `STATELOCK_NAVIGATION_STALL_TIMEOUT` (10 s) Statelock ends the session, so the agent gets an error and starts a new one instead of hanging.
 
 ### Allowed and attributed
 

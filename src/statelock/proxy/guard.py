@@ -165,7 +165,7 @@ class GuardTimings:
     # A reload or history navigation whose URL could not be looked up labels the next
     # page load within this window only.
     unknown_navigation_window: float = 1.0
-    # A page load Chromium started but never paused for the guard is stopped after this.
+    # A page load Chromium started but never paused for the guard is reported after this.
     navigation_stall_timeout: float = 10.0
 
 
@@ -214,6 +214,7 @@ class PageGuard:
         timings: GuardTimings | None = None,
         on_script_click: ScriptClickHandler | None = None,
         agent_script_active: Callable[[str], bool] = lambda _target_id: False,
+        on_stalled_load: Callable[[str, str], None] = lambda _target_id, _url: None,
     ) -> None:
         self.pages = pages
         self.url_patterns = url_patterns
@@ -222,6 +223,7 @@ class PageGuard:
         self.timings = timings or GuardTimings()
         self.on_script_click = on_script_click
         self.agent_script_active = agent_script_active
+        self.on_stalled_load = on_stalled_load
         # Statelock sessionId -> per-target state
         self._states: dict[str, TargetGuardState] = {}
         self._tasks = BackgroundTasks("page guard")
@@ -410,9 +412,9 @@ class PageGuard:
         self._tasks.spawn(self._decide(session_id, state, params))
 
     def _watch_page_load(self, state: TargetGuardState, params: dict[str, Any]) -> None:
-        """Chromium sometimes starts a page load and never pauses it (Fetch.requestPaused),
-        so it neither reaches the guard nor the site, and the agent's navigation hangs. Such
-        a load is stopped after a while, so the agent gets an error it can retry."""
+        """Chromium has been seen to start a page load and never pause it (Fetch.requestPaused):
+        it neither reaches the guard nor the site, and the agent's navigation hangs, as do later
+        ones in that browser. Such a load is reported (on_stalled_load) after a while."""
         request_id = params.get("requestId")
         url = str(as_dict(params.get("request")).get("url") or "")
         if (
@@ -424,7 +426,7 @@ class PageGuard:
         ):
             return
         state.unpaused_loads[request_id] = asyncio.get_running_loop().call_later(
-            self.timings.navigation_stall_timeout, self._stop_stalled_load, state, request_id, url
+            self.timings.navigation_stall_timeout, self._report_stalled_load, state, request_id, url
         )
 
     def _load_progressed(self, state: TargetGuardState, request_id: Any) -> None:
@@ -432,15 +434,15 @@ class PageGuard:
         if timer is not None:
             timer.cancel()
 
-    def _stop_stalled_load(self, state: TargetGuardState, request_id: str, url: str) -> None:
+    def _report_stalled_load(self, state: TargetGuardState, request_id: str, url: str) -> None:
         state.unpaused_loads.pop(request_id, None)
         logger.warning(
-            "Chromium did not pause the page load of %s for the guard within %g s; stopping it (target=%s)",
+            "Chromium did not pause the page load of %s for the guard within %g s (target=%s)",
             "".join(origin_and_path(url) or ()),
             self.timings.navigation_stall_timeout,
             state.target_id,
         )
-        self._tasks.spawn(self.pages.connection.send("Page.stopLoading", session_id=state.session_id))
+        self.on_stalled_load(state.target_id, url)
 
     def _handle_frame_navigated(self, state: TargetGuardState, params: dict[str, Any]) -> None:
         frame = as_dict(params.get("frame"))

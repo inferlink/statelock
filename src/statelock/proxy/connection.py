@@ -138,6 +138,7 @@ class _Pending:
     channel: CdpChannel
     message_id: int
     attach_target: str | None  # Target.attachToTarget: the target being attached
+    session_id: str | None = None
 
 
 class CdpMultiplexer:
@@ -196,7 +197,7 @@ class CdpMultiplexer:
         attach_target = (
             as_str(as_dict(payload.get("params")).get("targetId")) if method == "Target.attachToTarget" else None
         )
-        self._pending[self._next_id] = _Pending(channel, message_id, attach_target)
+        self._pending[self._next_id] = _Pending(channel, message_id, attach_target, as_str(payload.get("sessionId")))
         payload["id"] = self._next_id
         if trace.isEnabledFor(logging.DEBUG):
             trace.debug("%s >  %s", channel.name, describe(payload))
@@ -205,6 +206,10 @@ class CdpMultiplexer:
         except BaseException:
             self._pending.pop(self._next_id, None)
             raise
+
+    def unanswered(self, channel: CdpChannel) -> list[tuple[int, str | None]]:
+        """The channel's commands the browser has not answered: (id, sessionId)."""
+        return [(p.message_id, p.session_id) for p in self._pending.values() if p.channel is channel]
 
     def _session_refusal(self, channel: CdpChannel, payload: dict[str, Any]) -> dict[str, Any] | None:
         """An error answer when the command names a session of the other channel (or none)."""

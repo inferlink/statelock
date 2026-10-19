@@ -571,7 +571,7 @@ All settings are `STATELOCK_*` environment variables (`statelock/settings.py`). 
 | `STATELOCK_GUARD_READY_TIMEOUT` | 10 | Seconds an agent command on a new page or iframe waits for Statelock's setup there (the page guard). |
 | `STATELOCK_CDP_COMMAND_TIMEOUT` | 5 | Seconds Statelock's own CDP commands to the browser may take. |
 | `STATELOCK_ATTRIBUTION_TIMEOUT` | 1 | Seconds to wait for a request's initiator before it is logged as `unknown`. |
-| `STATELOCK_NAVIGATION_STALL_TIMEOUT` | 10 | Seconds after which a page load that Chromium started but never handed to the page guard is stopped. Chromium rarely does this (seen on a session's first page load); the agent's navigation then fails with `net::ERR_ABORTED` and can be retried, instead of hanging. |
+| `STATELOCK_NAVIGATION_STALL_TIMEOUT` | 10 | Seconds after which a page load that Chromium started but never handed to the page guard ends the session. Chromium rarely does this (seen on a session's first page load, and later loads in that browser stall too). The agent's waiting command fails with "Chromium stopped loading pages; start a new Statelock session" instead of hanging, and the proxy log lists Chromium's processes and stderr. |
 | `STATELOCK_TRUSTED_SUBMIT_WINDOW` | 3 | Seconds after a submit from real input during which the form's navigation counts as trusted. |
 | `STATELOCK_AGENT_NAVIGATION_WINDOW` | 10 | Seconds after an agent navigation command during which a page load is attributed to it. |
 | `STATELOCK_MEMORY_SETTLE` | 0.5 | Seconds after a page load before the second capture of remembered fields. |

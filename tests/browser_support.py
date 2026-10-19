@@ -34,6 +34,7 @@ from statelock.app import create_app, get_services  # noqa: E402
 from statelock.auth import hash_key  # noqa: E402
 from statelock.client import StatelockPolicyViolationError  # noqa: E402
 from statelock.client.connection import connect_with_headers  # noqa: E402
+from statelock.proxy.bridge import STALLED_CLOSE_REASON  # noqa: E402
 from statelock.settings import Settings  # noqa: E402
 
 # Authentication is on for every browser test: each agent connects with its own key.
@@ -283,19 +284,16 @@ async def _first_load(page: Any, url: str) -> None:
     """The first page.goto of a session. On a timeout, say whether the test site still
     answers directly, so a CI failure shows whether the server or the browser path stalled."""
     try:
-        try:
-            await page.goto(url, timeout=FIRST_LOAD_TIMEOUT_MS)
-        except playwright_api.Error as error:
-            # Statelock stops a page load Chromium never paused for its guard (rarely, the
-            # first one of a session); an agent retries, and so does the test.
-            if "net::ERR_ABORTED" not in str(error):
-                raise
-            await page.goto(url, timeout=FIRST_LOAD_TIMEOUT_MS)
+        await page.goto(url, timeout=FIRST_LOAD_TIMEOUT_MS)
     except playwright_api.TimeoutError as error:
         direct = await asyncio.to_thread(_probe, url)
         raise AssertionError(
             f"first load of {url} timed out through Statelock; {direct}; page.url={page.url}"
         ) from error
+
+
+class _BrowserStalled(Exception):
+    """Statelock ended the session at its first page load: Chromium stopped loading pages."""
 
 
 def _probe(url: str) -> str:
@@ -310,7 +308,19 @@ async def _governed(
     server: dict[str, Any], agent: str, start: str, steps: Callable[[Any, Any], Awaitable[Any]]
 ) -> tuple[str, Any]:
     """Connect ``agent``, load ``start``, run ``steps(conn, page)`` under the guard, close.
-    Returns (session id, the steps' result or the StatelockPolicyViolationError)."""
+    Returns (session id, the steps' result or the StatelockPolicyViolationError).
+
+    When Statelock ends the session at the first page load because Chromium stopped loading
+    pages (rare; seen in CI), the test starts a new session once, as an agent would."""
+    try:
+        return await _governed_once(server, agent, start, steps)
+    except _BrowserStalled:
+        return await _governed_once(server, agent, start, steps)
+
+
+async def _governed_once(
+    server: dict[str, Any], agent: str, start: str, steps: Callable[[Any, Any], Awaitable[Any]]
+) -> tuple[str, Any]:
     async with playwright_api.async_playwright() as p:
         conn = await connect_with_headers(p, server["ws"], agent, api_key=agent_key(agent))
         page = conn.browser.contexts[0].pages[0]
@@ -318,7 +328,12 @@ async def _governed(
             async with conn.guard():
                 # The first load waits for Chromium to start inside the proxy, which can take
                 # longer than Playwright's 30 s default on a busy Docker host.
-                await _first_load(page, server["base"] + start)
+                try:
+                    await _first_load(page, server["base"] + start)
+                except playwright_api.Error as error:
+                    if STALLED_CLOSE_REASON in str(error):
+                        raise _BrowserStalled from error
+                    raise
                 return conn.session_id, await steps(conn, page)
         except StatelockPolicyViolationError as violation:
             return conn.session_id, violation

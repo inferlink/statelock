@@ -190,6 +190,8 @@ class _Session:
     scripts: AgentScripts
     field_watcher: FieldMemoryWatcher
     replayer: ScriptClickReplayer
+    # Set when Chromium stops loading pages (see PageGuard.on_stalled_load).
+    browser_stalled: asyncio.Event
 
     async def respond(self, request: dict[str, Any], body: dict[str, Any]) -> None:
         """Answer an agent command in-band (only commands with an id get an answer).
@@ -268,6 +270,10 @@ class CdpBridge:
             # stop before the governor they call, and Chromium is always closed last.
             async with contextlib.AsyncExitStack() as stack:
                 await self._run_session(stack, client_ws, admission, reporter)
+        except BrowserStalledError as error:
+            failed = True
+            logger.error("Statelock session %s ended: %s", admission.session_id, error)  # noqa: TRY400 - no traceback
+            await reporter.close(CLOSE_CODE_INTERNAL_ERROR, STALLED_CLOSE_REASON)
         except Exception:  # logged once here; the agent sees CLOSE_CODE_INTERNAL_ERROR
             failed = True
             logger.exception("Statelock session %s failed", admission.session_id)
@@ -298,7 +304,7 @@ class CdpBridge:
         pages = PageSessions(browser.connection)
         await self._restore_saved_session(stack, browser.connection, pages, admission, reporter)
         session = await self._build_session(stack, browser, pages, client_ws, admission=admission, reporter=reporter)
-        await self._run_pumps(session)
+        await self._run_pumps(session, browser)
 
     async def _restore_saved_session(
         self,
@@ -378,7 +384,10 @@ class CdpBridge:
             max_session_bytes=settings.download_max_session_bytes,
         )
         stack.push_async_callback(downloads.close)
-        guard = self._build_guard(pages, governor, replayer, scripts, admission.agent_id)
+        browser_stalled = asyncio.Event()
+        guard = self._build_guard(
+            pages, governor, replayer, scripts, admission.agent_id, browser_stalled=browser_stalled
+        )
         if guard is not None:
             stack.push_async_callback(guard.close)
         stack.push_async_callback(targets.close)
@@ -421,6 +430,7 @@ class CdpBridge:
             scripts=scripts,
             field_watcher=field_watcher,
             replayer=replayer,
+            browser_stalled=browser_stalled,
         )
 
     def _saved_session_key(self, admission: Admission) -> SavedSessionKey | None:
@@ -453,6 +463,8 @@ class CdpBridge:
         replayer: ScriptClickReplayer,
         scripts: AgentScripts,
         agent_id: str,
+        *,
+        browser_stalled: asyncio.Event,
     ) -> PageGuard | None:
         patterns = self.services.evaluator.guard_url_patterns(agent_id)
         if patterns is not None and not patterns:
@@ -471,17 +483,26 @@ class CdpBridge:
             ),
             on_script_click=replayer.replay if settings.replay_script_clicks else None,
             agent_script_active=scripts.active,
+            on_stalled_load=lambda _target_id, _url: browser_stalled.set(),
         )
 
-    async def _run_pumps(self, session: _Session) -> None:
+    async def _run_pumps(self, session: _Session, browser: GovernedBrowser) -> None:
+        stalled = asyncio.create_task(session.browser_stalled.wait())
         pumps = {
             asyncio.create_task(self._client_to_browser(session)),
             asyncio.create_task(self._browser_to_client(session)),
+            stalled,
         }
         done, pending = await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+        if stalled in done:
+            # The agent's navigation (and any other waiting command) gets the reason, not a hang.
+            for message_id, cdp_session_id in browser.multiplexer.unanswered(session.agent_channel):
+                request = {"id": message_id, **({"sessionId": cdp_session_id} if cdp_session_id else {})}
+                await session.respond(request, statelock_error(STALLED_CLOSE_REASON))
+            raise BrowserStalledError(await _stall_diagnostics(browser))
         for task in done:
             task.result()
 
@@ -628,6 +649,26 @@ class CdpBridge:
                     continue
                 # An injected secret never reaches the agent (e.g. reading the field's value back).
                 await session.client_ws.send_text(session.scrubber.text(filter_network_message(raw_message)))
+
+
+class BrowserStalledError(Exception):
+    """Chromium started a page load and never handed it to the guard (or the site)."""
+
+
+# Later page loads in that browser stall too (seen in CI), so the session ends: the agent
+# starts a new one, with a new browser.
+STALLED_CLOSE_REASON = "Chromium stopped loading pages; start a new Statelock session"
+
+
+async def _stall_diagnostics(browser: GovernedBrowser) -> str:
+    """What the logs need to tell why Chromium stalled: its processes and its stderr."""
+    try:
+        info = await browser.connection.send("SystemInfo.getProcessInfo")
+        processes = ", ".join(sorted(str(p.get("type")) for p in info.get("processInfo", [])))
+    except CdpError as error:
+        processes = f"unavailable ({error})"
+    tail = browser.stderr.text() or "(empty)"
+    return f"Chromium stopped loading pages. Processes: {processes}. Chromium stderr: {tail}"
 
 
 @contextlib.contextmanager
