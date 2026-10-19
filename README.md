@@ -680,7 +680,7 @@ ruff check src tests examples && ruff format --check src tests examples && pytho
 
 - The proxy runs on Linux and macOS (also under uvloop); Windows is not supported.
 - Python 3.10+ (the `browser-use` extra needs 3.11+). The Docker images use Python 3.12 (Playwright's Ubuntu 24.04 "noble" image). `mypy` is strict for `core` and `policy`.
-- The Docker image pins Playwright 1.56.0 (Chromium 141) and runs as `pwuser`. On Linux hosts, `./artifacts` must be writable by that user.
+- The Docker image pins Playwright 1.64.0 (Chromium 156) and runs as `pwuser`. On Linux hosts, `./artifacts` must be writable by that user.
 - Injected JavaScript lives in `src/statelock/proxy/js/`.
 - CI (`.github/workflows/ci.yml`) also runs the browser tests with `STATELOCK_REQUIRE_BROWSER=1`, so they fail instead of skipping without Chromium, plus the extras' tests and the JavaScript SDK.
 - Contributions: see [CONTRIBUTING.md](https://github.com/inferlink/statelock/blob/main/CONTRIBUTING.md). Every commit needs a DCO sign-off (`git commit -s`); a check on pull requests enforces it.

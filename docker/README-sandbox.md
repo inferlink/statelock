@@ -4,7 +4,7 @@
 compose default). Chromium's sandbox needs unprivileged user namespaces, which
 Docker's default seccomp profile blocks, so `compose.yaml` uses
 `docker/seccomp_profile.json`: Playwright's profile (Docker's default plus
-user-namespace cloning), v1.56.0, Apache 2.0 (Microsoft). The image runs as the
+user-namespace cloning), v1.64.0, Apache 2.0 (Microsoft). The image runs as the
 non-root user `pwuser`.
 
 Outside compose, Statelock's own default is `STATELOCK_CHROMIUM_SANDBOX=false`.
@@ -15,7 +15,7 @@ Keep it pinned to the Playwright version in the Dockerfile:
 
 ```bash
 curl -fsSL -o docker/seccomp_profile.json \
-  https://raw.githubusercontent.com/microsoft/playwright/v1.56.0/utils/docker/seccomp_profile.json
+  https://raw.githubusercontent.com/microsoft/playwright/v1.64.0/utils/docker/seccomp_profile.json
 ```
 
 ## Check

@@ -4,7 +4,7 @@
 #   ojs      dev + Stagehand, for the OJS demo (examples/ojs: the mock journal and the agent)
 # The Playwright base image pins Chromium; the pip pin below must match its version.
 # Ubuntu 24.04 (noble), Python 3.12: browser-use needs Python 3.11+ (jammy has 3.10).
-ARG PLAYWRIGHT_IMAGE=mcr.microsoft.com/playwright/python:v1.56.0-noble
+ARG PLAYWRIGHT_IMAGE=mcr.microsoft.com/playwright/python:v1.64.0-noble
 
 FROM ${PLAYWRIGHT_IMAGE} AS runtime
 # Ubuntu 24.04 marks its Python "externally managed"; this image is ours alone, so pip
@@ -21,7 +21,7 @@ RUN python3 -c 'import sys; assert sys.version_info >= (3, 11), sys.version' \
     && (command -v python >/dev/null || ln -s "$(command -v python3)" /usr/local/bin/python)
 COPY pyproject.toml README.md LICENSE NOTICE /src/statelock/
 COPY src /src/statelock/src
-RUN python3 -m pip install "/src/statelock" "playwright==1.56.0"
+RUN python3 -m pip install "/src/statelock" "playwright==1.64.0"
 COPY policies /app/policies
 RUN mkdir -p /app/artifacts && chown -R pwuser:pwuser /app
 USER pwuser
