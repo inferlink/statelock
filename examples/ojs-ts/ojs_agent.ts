@@ -71,9 +71,19 @@ async function login(page: Page): Promise<void> {
   // Statelock: a placeholder, not the password. Statelock types the secret into the field.
   await page.locator("input[type=password]").fill(secret(settings.passwordSecret));
   await page.locator("form#login button[type=submit]").click();
-  await page.waitForLoadState("networkidle");
-  if (page.url().includes("/login")) throw new Error("Login failed: still on the login page");
+  // Wait for the result, not for "networkidle": Statelock returns the click once it has
+  // checked the policy, by which time the next page may already be idle.
+  if (!(await leftLoginPage(page))) throw new Error("Login failed: still on the login page");
   console.log(`Logged in as ${settings.username}`);
+}
+
+async function leftLoginPage(page: Page, timeoutMs = 15_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!page.url().includes("/login")) return true;
+    await page.waitForTimeout(200);
+  }
+  return false;
 }
 
 async function activeSubmissionIds(page: Page): Promise<number[]> {

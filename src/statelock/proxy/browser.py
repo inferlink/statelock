@@ -28,6 +28,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import IO, BinaryIO
 
 from playwright.async_api import async_playwright
 
@@ -107,14 +108,15 @@ class ChromiumProcess:
     """Chromium's main process, started by ``subprocess.Popen``.
 
     Not the event loop's own spawn: uvloop (uvicorn's loop when installed) uses
-    posix_spawn on macOS, which skips ``preexec_fn``, so the CDP pipe never reached
+    posix_spawn on macOS, which skips ``preexec_fn``, so the CDP pipe would not reach
     fds 3 and 4. Popen forks, runs it in the child, then execs, with any loop.
     """
 
-    def __init__(self, popen: subprocess.Popen[bytes], stderr: asyncio.StreamReader) -> None:
+    def __init__(self, popen: subprocess.Popen[bytes]) -> None:
         self._popen = popen
         self.pid = popen.pid
-        self.stderr = stderr
+        assert popen.stderr is not None  # noqa: S101 - stderr=PIPE
+        self.stderr: IO[bytes] = popen.stderr
 
     @property
     def returncode(self) -> int | None:
@@ -178,6 +180,20 @@ class _StderrTail:
         while chunk := await stream.read(65536):
             self.data.extend(chunk)
             del self.data[:-STDERR_TAIL_BYTES]
+
+    async def drain_pipe(self, pipe: IO[bytes]) -> None:
+        """Read Chromium's stderr pipe until it closes; the pipe is closed on any exit."""
+        try:
+            stream = asyncio.StreamReader()
+            transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+                lambda: asyncio.StreamReaderProtocol(stream), pipe
+            )
+            try:
+                await self.drain(stream)
+            finally:
+                transport.close()
+        finally:
+            pipe.close()
 
     def text(self) -> str:
         return bytes(self.data).decode("utf-8", errors="replace").strip()
@@ -365,9 +381,9 @@ class ChromiumCdpLauncher:
         multiplexer: CdpMultiplexer | None = None
         connection: CdpConnection | None = None
         try:
-            process, read_fd, write_fd = await self._spawn(args)
-            stderr_reader = asyncio.create_task(stderr.drain(process.stderr))
-            multiplexer = CdpMultiplexer(await CdpPipe.open(read_fd, write_fd))
+            process, from_chromium, to_chromium = self._spawn(args)
+            stderr_reader = asyncio.create_task(stderr.drain_pipe(process.stderr))
+            multiplexer = CdpMultiplexer(await CdpPipe.open(from_chromium, to_chromium))
             multiplexer.start()
             connection = CdpConnection(multiplexer.statelock, command_timeout=self.command_timeout)
             connection.open()
@@ -386,17 +402,22 @@ class ChromiumCdpLauncher:
             process, multiplexer, connection, profile, stderr, stderr_reader, stop_timeout=self.stop_timeout
         )
 
-    async def _spawn(self, args: list[str]) -> tuple[ChromiumProcess, int, int]:
-        """Start Chromium; returns it and our ends of its CDP pipe (read, write)."""
+    def _spawn(self, args: list[str]) -> tuple[ChromiumProcess, BinaryIO, BinaryIO]:
+        """Start Chromium; returns it and our ends of its CDP pipe (Chromium's output, its input)."""
         to_chromium = os.pipe()
         from_chromium = os.pipe()
-        # The child's ends, above the fds it is given, so moving them to 3 and 4 overwrites neither.
-        child_read = fcntl.fcntl(to_chromium[0], fcntl.F_DUPFD_CLOEXEC, FIRST_FREE_FD)
-        child_write = fcntl.fcntl(from_chromium[1], fcntl.F_DUPFD_CLOEXEC, FIRST_FREE_FD)
+        # Our ends as files at once, so each failure path below closes them.
+        ours = (os.fdopen(from_chromium[0], "rb", buffering=0), os.fdopen(to_chromium[1], "wb", buffering=0))
+        theirs = [to_chromium[0], from_chromium[1]]
         try:
+            # The child's ends, above the fds it is given, so moving them to 3 and 4 overwrites neither.
+            child_read = fcntl.fcntl(to_chromium[0], fcntl.F_DUPFD_CLOEXEC, FIRST_FREE_FD)
+            theirs.append(child_read)
+            child_write = fcntl.fcntl(from_chromium[1], fcntl.F_DUPFD_CLOEXEC, FIRST_FREE_FD)
+            theirs.append(child_write)
             # close_fds=False: fds 3 and 4 are set up in the child, after the point where
-            # close_fds would close them. Every other fd the proxy opens is close-on-exec.
-            popen = subprocess.Popen(  # noqa: S603, ASYNC220 - Playwright's Chromium; fork and exec only
+            # close_fds would close them. The proxy opens its own fds close-on-exec.
+            popen = subprocess.Popen(  # noqa: S603 - Playwright's Chromium, fixed arguments
                 args,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -407,27 +428,13 @@ class ChromiumCdpLauncher:
                 preexec_fn=_child_setup(child_read, child_write),  # noqa: PLW1509 - only dup2 and prctl
             )
         except BaseException:
-            for fd in (*to_chromium, *from_chromium):
-                os.close(fd)
+            for end in ours:
+                end.close()
             raise
         finally:
-            os.close(child_read)
-            os.close(child_write)
-        os.close(to_chromium[0])
-        os.close(from_chromium[1])
-        try:
-            stderr = asyncio.StreamReader()
-            assert popen.stderr is not None  # noqa: S101 - stderr=PIPE
-            await asyncio.get_running_loop().connect_read_pipe(
-                lambda: asyncio.StreamReaderProtocol(stderr), popen.stderr
-            )
-        except BaseException:
-            popen.kill()
-            popen.wait()
-            os.close(from_chromium[0])
-            os.close(to_chromium[1])
-            raise
-        return ChromiumProcess(popen, stderr), from_chromium[0], to_chromium[1]
+            for fd in theirs:
+                os.close(fd)
+        return ChromiumProcess(popen), *ours
 
     async def _wait_until_ready(
         self, connection: CdpConnection, process: ChromiumProcess, stderr_reader: asyncio.Task[None]
@@ -438,7 +445,7 @@ class ChromiumCdpLauncher:
         except CdpError as error:
             # The pipe closed (Chromium exited) or nothing answered in time.
             with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(asyncio.shield(process.wait()), timeout=EXIT_CODE_WAIT)
+                await asyncio.wait_for(process.wait(), timeout=EXIT_CODE_WAIT)
             if process.returncode is not None:
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(asyncio.shield(stderr_reader), timeout=EXIT_CODE_WAIT)

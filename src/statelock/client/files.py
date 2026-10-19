@@ -18,8 +18,11 @@ from playwright.async_api import Error as PlaywrightError
 
 from statelock.client import patching, transfer
 from statelock.client.transfer import DownloadInfo, UploadFile
+from statelock.client.violations import session_ended
 
 T = TypeVar("T")
+
+DETACH_TIMEOUT = 5.0  # seconds; a session the connection lost is not waited for longer
 
 # Per browser (or context without one): its Statelock.session answer.
 _sessions: weakref.WeakKeyDictionary[Any, dict[str, Any] | None] = weakref.WeakKeyDictionary()
@@ -29,11 +32,18 @@ _sessions: weakref.WeakKeyDictionary[Any, dict[str, Any] | None] = weakref.WeakK
 async def cdp_session(page: Page) -> AsyncIterator[CDPSession]:
     """A short-lived CDP session on the page (Statelock.* commands run on it)."""
     session = await page.context.new_cdp_session(page)
+    ended = False
     try:
         yield session
+    except Exception as error:
+        # Statelock ended the session: nothing is left to detach, and Playwright's
+        # detach on a closing connection can wait forever.
+        ended = session_ended(error)
+        raise
     finally:
-        with contextlib.suppress(PlaywrightError):
-            await session.detach()
+        if not ended:
+            with contextlib.suppress(PlaywrightError, asyncio.TimeoutError):
+                await asyncio.wait_for(session.detach(), DETACH_TIMEOUT)
 
 
 async def run(steps: transfer.Steps[T], cdp: CDPSession, write: Callable[[bytes], Awaitable[None]] | None = None) -> T:

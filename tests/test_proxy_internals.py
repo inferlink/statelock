@@ -64,7 +64,7 @@ def test_network_events_hide_cookies_and_auth_headers() -> None:
     event = {
         "method": "Network.requestWillBeSentExtraInfo",
         "params": {
-            "headers": {"Cookie": "secret=1", "Authorization": "Bearer secret", "X-Ok": "yes"},
+            "headers": {"Cookie": "secret=1", "Authorization": "Bearer secret", "X-Api-Key": "secret", "X-Ok": "yes"},
             "headersText": "Cookie: secret=1",
             "associatedCookies": [{"cookie": {"value": "secret"}}],
         },

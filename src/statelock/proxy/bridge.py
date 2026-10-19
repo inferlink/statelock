@@ -467,6 +467,7 @@ class CdpBridge:
                 attribution_timeout=settings.attribution_timeout,
                 trusted_submit_window=settings.trusted_submit_window,
                 agent_navigation_window=settings.agent_navigation_window,
+                navigation_stall_timeout=settings.navigation_stall_timeout,
             ),
             on_script_click=replayer.replay if settings.replay_script_clicks else None,
             agent_script_active=scripts.active,

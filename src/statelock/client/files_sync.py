@@ -21,6 +21,7 @@ from playwright.sync_api import Error as PlaywrightError
 
 from statelock.client import patching, transfer
 from statelock.client.transfer import DownloadInfo, UploadFile
+from statelock.client.violations import session_ended
 
 T = TypeVar("T")
 
@@ -32,11 +33,20 @@ _sessions: weakref.WeakKeyDictionary[Any, dict[str, Any] | None] = weakref.WeakK
 def cdp_session(page: Page) -> Iterator[CDPSession]:
     """A short-lived CDP session on the page (Statelock.* commands run on it)."""
     session = page.context.new_cdp_session(page)
+    ended = False
     try:
         yield session
+    except Exception as error:
+        # Statelock ended the session: nothing is left to detach, and Playwright's
+        # detach on a closing connection can wait forever.
+        ended = session_ended(error)
+        raise
     finally:
-        with contextlib.suppress(PlaywrightError):
-            session.detach()
+        # The sync API cannot bound a detach, so none is tried on a lost connection.
+        browser = page.context.browser
+        if not ended and (browser is None or browser.is_connected()):
+            with contextlib.suppress(PlaywrightError):
+                session.detach()
 
 
 def run(steps: transfer.Steps[T], cdp: CDPSession, write: Callable[[bytes], Any] | None = None) -> T:

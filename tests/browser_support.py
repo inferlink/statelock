@@ -283,7 +283,14 @@ async def _first_load(page: Any, url: str) -> None:
     """The first page.goto of a session. On a timeout, say whether the test site still
     answers directly, so a CI failure shows whether the server or the browser path stalled."""
     try:
-        await page.goto(url, timeout=FIRST_LOAD_TIMEOUT_MS)
+        try:
+            await page.goto(url, timeout=FIRST_LOAD_TIMEOUT_MS)
+        except playwright_api.Error as error:
+            # Statelock stops a page load Chromium never paused for its guard (rarely, the
+            # first one of a session); an agent retries, and so does the test.
+            if "net::ERR_ABORTED" not in str(error):
+                raise
+            await page.goto(url, timeout=FIRST_LOAD_TIMEOUT_MS)
     except playwright_api.TimeoutError as error:
         direct = await asyncio.to_thread(_probe, url)
         raise AssertionError(
@@ -418,8 +425,10 @@ def running_server(
     secrets: tuple[Secret, ...] | None = None,
     perception: Any = None,
     rule_modules: str = "",
+    **settings: Any,
 ) -> Iterator[dict[str, Any]]:
-    """Start the proxy with a site (default: the test site); yields {base, ws, root, app}."""
+    """Start the proxy with a site (default: the test site); yields {base, ws, root, app}.
+    Extra keyword arguments are Settings fields."""
     root = tmp_path_factory.mktemp("statelock")
     # A failing browser test then shows its CDP traffic (methods and ids) in the captured log.
     logging.getLogger("statelock.cdp").setLevel(logging.DEBUG)
@@ -440,7 +449,7 @@ def running_server(
         ),
         encoding="utf-8",
     )
-    settings = Settings(
+    proxy_settings = Settings(
         policy_file=policy_path,
         artifact_dir=root / "artifacts",
         demo=True,
@@ -452,8 +461,9 @@ def running_server(
             root, f"http://127.0.0.1:{port}", secrets if secrets is not None else PORTAL_SECRETS
         ),
         rule_modules=rule_modules,
+        **settings,
     )
-    app = create_app(settings)
+    app = create_app(proxy_settings)
     if perception is not None:  # a fake vision-language model (visual_assert)
         get_services(app).evaluator.perception = perception
     for router in routers if routers is not None else (site_router(),):

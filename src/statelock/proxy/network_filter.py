@@ -8,7 +8,16 @@ from typing import Any
 
 from statelock.audit.redaction import REDACTED
 
-SENSITIVE_HEADERS = {"cookie", "set-cookie", "authorization", "proxy-authorization"}
+SENSITIVE_HEADERS = {
+    "cookie",
+    "set-cookie",
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "x-auth-token",
+    "x-csrf-token",
+    "x-xsrf-token",
+}
 # Cookie lists stay lists: CDP clients such as Playwright iterate them.
 COOKIE_LISTS = {"associatedCookies", "blockedCookies", "exemptedCookies"}
 # Optional raw header text is dropped rather than nulled, as CDP omits it when absent.
@@ -33,10 +42,8 @@ def filter_network_message(raw: str) -> str:
     Any other message is returned unchanged, byte for byte."""
     if '"Network.' not in raw:
         return raw
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return raw
+    # Messages reach here already parsed once by the multiplexer, which drops anything else.
+    payload = json.loads(raw)
     if not isinstance(payload, dict) or not str(payload.get("method", "")).startswith("Network."):
         return raw
     return json.dumps(_clean(payload))

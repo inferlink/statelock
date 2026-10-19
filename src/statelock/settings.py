@@ -11,6 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from statelock.policy.perception import DEFAULT_RETRIES as DEFAULT_PERCEPTION_RETRIES
 from statelock.policy.perception import DEFAULT_TIMEOUT as DEFAULT_PERCEPTION_TIMEOUT
+from statelock.proxy.browser import DEFAULT_START_TIMEOUT
 from statelock.proxy.connection import DEFAULT_COMMAND_TIMEOUT
 
 # The longest a session URL stays usable, in seconds (POST /sessions and the server default).
@@ -66,7 +67,9 @@ class Settings(BaseSettings):
 
     # Chromium.
     chromium_sandbox: bool = False  # the sandbox needs a non-root user and a permissive seccomp profile
-    chromium_start_timeout: float = Field(default=30.0, gt=0)  # seconds for Chromium to answer on its CDP pipe
+    chromium_start_timeout: float = Field(
+        default=DEFAULT_START_TIMEOUT, gt=0
+    )  # seconds for Chromium to answer on its CDP pipe
 
     # Timing (seconds).
     capture_timeout: float = Field(default=2.5, gt=0)
@@ -76,6 +79,8 @@ class Settings(BaseSettings):
     guard_ready_timeout: float = Field(default=10.0, gt=0)
     cdp_command_timeout: float = Field(default=DEFAULT_COMMAND_TIMEOUT, gt=0)  # each of Statelock's own CDP commands
     attribution_timeout: float = Field(default=1.0, gt=0)
+    # A page load Chromium never pauses for the guard is stopped after this many seconds.
+    navigation_stall_timeout: float = Field(default=10.0, gt=0)
     trusted_submit_window: float = Field(default=3.0, gt=0)
     agent_navigation_window: float = Field(default=10.0, gt=0)
     memory_settle: float = Field(default=0.5, ge=0)  # second capture after a page load

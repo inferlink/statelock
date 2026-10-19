@@ -137,7 +137,7 @@ A `trigger` limits an entry to particular actions. It goes in the entry beside t
 
 `id` names the policy in verdicts, violations and the evidence (`policy_id`), so with several policies for one agent the record says which one blocked. Without it the id is `<agent_id>#<n>`: the agent's n-th policy across the loaded policy files, in load order (so reordering policies renames the defaults; set `id` where it matters). Ids are unique across all loaded policy files.
 
-`cookie_access` applies to the agent (the union of its policies). Cookies are not exported by default: with the site's session cookies, Playwright's `page.request` / `context.request` (without `install()`) or another HTTP client would act as the logged-in user outside Statelock. So Statelock answers cookie reads over CDP (`context.cookies()`, `storage_state()`) with only the cookies `cookie_access` allows. With no `cookie_access`, the read is declined (`cookie_export`), so those calls fail instead of bypassing Statelock, and the session continues. Either way the read is recorded, with cookie names, never values. `all: true` hands over the site's session cookies, which lets agent-side HTTP act as the user outside Statelock; use it knowingly. For HTTP, use [`request_access`](#agent-side-http-request_access): after `install()`, `page.request` goes through Statelock.
+`cookie_access` applies to the agent (the union of its policies). Cookies are not exported by default: with the site's session cookies, Playwright's `page.request` / `context.request` (without `install()`) or another HTTP client would act as the logged-in user outside Statelock. So Statelock answers cookie reads over CDP (`context.cookies()`, `storage_state()`) with only the cookies `cookie_access` allows. With no `cookie_access`, the read is declined (`cookie_export`), so those calls fail instead of bypassing Statelock, and the session continues. Either way the read is recorded, with cookie names, never values. Network events the agent receives are filtered too: `Cookie`, `Set-Cookie`, `Authorization`, `Proxy-Authorization`, `X-Api-Key`, `X-Auth-Token`, `X-Csrf-Token` and `X-Xsrf-Token` header values read `[REDACTED]`, cookie lists are empty, and raw header text is removed. `all: true` hands over the site's session cookies, which lets agent-side HTTP act as the user outside Statelock; use it knowingly. For HTTP, use [`request_access`](#agent-side-http-request_access): after `install()`, `page.request` goes through Statelock.
 
 A policy, keys or secrets file with a repeated key at any level (two `pre_conditions:`, two `agents:` sections) is refused when it loads.
 
@@ -384,6 +384,8 @@ with statelock.client.connect_playwright_sync(playwright) as governed, governed.
 
 Under the hood, Statelock uses a CDP browser URL. Any framework that takes such a URL (Playwright, Puppeteer, browser-use, Stagehand, LangChain or CrewAI browser tools) can use one.
 
+After an action that navigates (a click on a submit button, Enter in a form), wait for its result (a URL, an element) rather than for `networkidle`. Statelock returns the action once it has checked the policy's post-conditions, and by then the next page may already be idle, so a wait that only listens for a new `networkidle` event can miss it.
+
 Naming: a *session* is one governed browser session. `SessionUrl` is the single-use URL that opens one, `PlaywrightSession` is that session with its connected Playwright browser, `statelock_session(page)` returns the `{session_id, agent_id}` of the page's session (None for a browser not behind Statelock), and a *saved session* is a stored browser login that a new session can restore.
 
 ### Session URLs
@@ -519,6 +521,7 @@ The wrapper returns copies; the tools passed in are not modified. `statelock_too
 **JavaScript and TypeScript.** `@statelock/client` (`js/`) is not yet on npm; build it from `js/` (`npm ci` runs the build). It has:
 
 - `createSessionUrl()`, `session.guard()`, `session.violation()` and `secret()`;
+- `statelockFetch()` (governed HTTP) and `listSavedSessions()` / `deleteSavedSession()`;
 - `connectPlaywright()` (with `setInputFiles` / `expectDownload`) and `install(browser)` for Playwright's file APIs;
 - CDP helpers for other frameworks.
 
@@ -537,7 +540,7 @@ All settings are `STATELOCK_*` environment variables (`statelock/settings.py`). 
 | `STATELOCK_PLUGINS` | `auto` | `auto`, `none`, or a comma-separated list of plugin names. |
 | `STATELOCK_DEBUG` | `false` | Also writes the latest action record to `artifacts/latest.json`. |
 | `STATELOCK_DEMO` | `false` | Enables the demo pages `/demo/finance`, `/demo/bank` and `/demo/erp`. |
-| `STATELOCK_LOG_LEVEL` | `INFO` | Level for Statelock's logging setup. Empty leaves logging to the host. |
+| `STATELOCK_LOG_LEVEL` | `INFO` | Python logging level, set on the root logger (all libraries). Empty leaves logging to the host. `DEBUG` also turns on `statelock.cdp`: one line per CDP message (method and ids, never page data), to see where a stalled page load stopped. |
 | `STATELOCK_AUTH_MODE` | `api_key` | `api_key` or `none` (development only). |
 | `STATELOCK_AUTH_KEYS_FILE` | none | Keys file (hashes). Required when `STATELOCK_AUTH_MODE=api_key`. |
 | `STATELOCK_SESSION_URL_TTL` | 300 | Seconds a session URL (`POST /sessions`, `statelock session-url`) stays usable (at most 3600). |
@@ -568,6 +571,7 @@ All settings are `STATELOCK_*` environment variables (`statelock/settings.py`). 
 | `STATELOCK_GUARD_READY_TIMEOUT` | 10 | Seconds an agent command on a new page or iframe waits for Statelock's setup there (the page guard). |
 | `STATELOCK_CDP_COMMAND_TIMEOUT` | 5 | Seconds Statelock's own CDP commands to the browser may take. |
 | `STATELOCK_ATTRIBUTION_TIMEOUT` | 1 | Seconds to wait for a request's initiator before it is logged as `unknown`. |
+| `STATELOCK_NAVIGATION_STALL_TIMEOUT` | 10 | Seconds after which a page load that Chromium started but never handed to the page guard is stopped. Chromium rarely does this (seen on a session's first page load); the agent's navigation then fails with `net::ERR_ABORTED` and can be retried, instead of hanging. |
 | `STATELOCK_TRUSTED_SUBMIT_WINDOW` | 3 | Seconds after a submit from real input during which the form's navigation counts as trusted. |
 | `STATELOCK_AGENT_NAVIGATION_WINDOW` | 10 | Seconds after an agent navigation command during which a page load is attributed to it. |
 | `STATELOCK_MEMORY_SETTLE` | 0.5 | Seconds after a page load before the second capture of remembered fields. |
@@ -674,6 +678,7 @@ python -m playwright install chromium
 ruff check src tests examples && ruff format --check src tests examples && python -m mypy && python -m pytest -q
 ```
 
+- The proxy runs on Linux and macOS (also under uvloop); Windows is not supported.
 - Python 3.10+ (the `browser-use` extra needs 3.11+). The Docker images use Python 3.12 (Playwright's Ubuntu 24.04 "noble" image). `mypy` is strict for `core` and `policy`.
 - The Docker image pins Playwright 1.56.0 (Chromium 141) and runs as `pwuser`. On Linux hosts, `./artifacts` must be writable by that user.
 - Injected JavaScript lives in `src/statelock/proxy/js/`.

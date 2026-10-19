@@ -22,12 +22,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, BinaryIO
 
 from statelock.core.jsonutil import as_dict, as_int, as_str, parse_cdp_message
 from statelock.wire import INVALID_REQUEST, PARSE_ERROR
@@ -73,15 +72,21 @@ class CdpPipe:
         self._transport = transport
 
     @classmethod
-    async def open(cls, read_fd: int, write_fd: int) -> CdpPipe:
-        """Wrap our ends of the two pipes (Chromium writes to read_fd's pipe, reads write_fd's)."""
+    async def open(cls, from_browser: BinaryIO, to_browser: BinaryIO) -> CdpPipe:
+        """Wrap our ends of the two pipes. Both are closed if this fails or is cancelled."""
         loop = asyncio.get_running_loop()
         # No size limit, as with any CDP client: screenshots and page text can be large.
         reader = asyncio.StreamReader(limit=2**31)
-        read_transport, _ = await loop.connect_read_pipe(
-            lambda: asyncio.StreamReaderProtocol(reader), os.fdopen(read_fd, "rb", buffering=0)
-        )
-        transport, _ = await loop.connect_write_pipe(asyncio.Protocol, os.fdopen(write_fd, "wb", buffering=0))
+        read_transport: asyncio.ReadTransport | None = None
+        try:
+            read_transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), from_browser)
+            transport, _ = await loop.connect_write_pipe(asyncio.Protocol, to_browser)
+        except BaseException:
+            if read_transport is not None:
+                read_transport.close()
+            from_browser.close()
+            to_browser.close()
+            raise
         return cls(reader, read_transport, transport)
 
     async def read(self) -> str | None:

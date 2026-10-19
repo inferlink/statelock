@@ -71,6 +71,12 @@ def _may_be_violation(error: BaseException) -> bool:
     return type(error).__name__ == CLOSED_ERROR_NAME or CLOSED_ERROR_TEXT in text or VIOLATION_MARKER in text
 
 
+def session_ended(error: BaseException) -> bool:
+    """Whether the error can mean Statelock ended the session (a violation, a blocked
+    download, or the connection closing because of one)."""
+    return isinstance(error, StatelockPolicyViolationError) or _may_be_violation(error)
+
+
 def _violation_for(
     error: BaseException, endpoint_url: str | None, session_id: str | None, api_key: str | None
 ) -> StatelockPolicyViolationError | None:
