@@ -26,7 +26,7 @@ from statelock.policy.fields import SessionMemory
 from statelock.proxy.attribution import tag_agent_code
 from statelock.proxy.browser import GovernedBrowser
 from statelock.proxy.commands import AGENT_NAVIGATION_METHODS, refused_command
-from statelock.proxy.connection import BrowserClosedError, CdpChannel, CdpConnection, CdpError
+from statelock.proxy.connection import BrowserClosedError, CdpChannel, CdpConnection, CdpError, describe, trace
 from statelock.proxy.cookies import COOKIE_METHODS, CookieReads
 from statelock.proxy.download_policy import SessionDownloadPolicy
 from statelock.proxy.downloads import AGENT_BEHAVIOR_METHODS, SessionDownloads
@@ -494,6 +494,8 @@ class CdpBridge:
     async def _handle_client_message(self, session: _Session, raw_message: str) -> bool:
         """Route one agent command. Returns False when the session ends."""
         payload = parse_cdp_message(raw_message)
+        if payload is not None and trace.isEnabledFor(logging.DEBUG):
+            trace.debug("agent ws > %s", describe(payload))
         if session.reporter.terminating:
             await session.reporter.refuse(payload)
             return True

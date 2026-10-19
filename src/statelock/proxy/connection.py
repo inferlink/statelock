@@ -23,6 +23,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -31,6 +33,9 @@ from statelock.core.jsonutil import as_dict, as_int, as_str, parse_cdp_message
 from statelock.wire import INVALID_REQUEST, PARSE_ERROR
 
 logger = logging.getLogger(__name__)
+# Every pipe message, one line each (method and ids only, never page data), at DEBUG level:
+# enable it to see where a stalled page load stopped.
+trace = logging.getLogger("statelock.cdp")
 
 EventListener = Callable[[dict[str, Any]], None]
 
@@ -188,6 +193,8 @@ class CdpMultiplexer:
         )
         self._pending[self._next_id] = _Pending(channel, message_id, attach_target)
         payload["id"] = self._next_id
+        if trace.isEnabledFor(logging.DEBUG):
+            trace.debug("%s >  %s", channel.name, describe(payload))
         try:
             self._pipe.write(json.dumps(payload))
         except BaseException:
@@ -231,6 +238,8 @@ class CdpMultiplexer:
         payload = parse_cdp_message(message)
         if payload is None:
             return
+        if trace.isEnabledFor(logging.DEBUG):
+            trace.debug("browser < %s", describe(payload))
         if isinstance(payload.get("id"), int):
             self._answer(payload)
         elif "sessionId" in payload:
@@ -241,6 +250,7 @@ class CdpMultiplexer:
     def _session_event(self, payload: dict[str, Any], message: str) -> None:
         owner = self._owners.get(str(payload["sessionId"]))
         if owner is None:
+            trace.debug("dropped: no channel owns session %s", payload["sessionId"])
             return
         method = payload.get("method")
         inner = as_str(as_dict(payload.get("params")).get("sessionId"))
@@ -259,6 +269,7 @@ class CdpMultiplexer:
         elif method == ATTACHED_EVENT and inner is not None:
             target_id = as_str(as_dict(params.get("targetInfo")).get("targetId")) or ""
             if self._statelock_attaching(target_id):
+                trace.debug("held: attach of session %s while Statelock attaches target %s", inner, target_id)
                 self._held[inner] = (target_id, message)
             else:
                 self._owners[inner] = self.agent
@@ -272,6 +283,8 @@ class CdpMultiplexer:
             owner = self._owners.get(inner)
             if owner is not None:
                 owner._deliver(message)
+            else:
+                trace.debug("dropped: no channel owns session %s", inner)
         else:
             self.agent._deliver(message)
 
@@ -302,6 +315,36 @@ class CdpMultiplexer:
                 del self._held[session_id]
                 self._owners[session_id] = self.agent
                 self.agent._deliver(message)
+
+
+TRACE_VALUE_MAX = 64
+TRACE_PLAIN = re.compile(rf"[\w.:-]{{1,{TRACE_VALUE_MAX}}}", re.ASCII)
+TRACED_PARAMS = ("sessionId", "targetId", "requestId", "frameId", "loaderId", "resourceType", "name")
+
+
+def describe(payload: dict[str, Any]) -> str:
+    """One trace line: the method and ids, never params that can hold page data."""
+    params = as_dict(payload.get("params"))
+    parts = [f"t={time.monotonic():.3f}"]
+    if "id" in payload:
+        parts.append(f"id={_trace_value(str(payload['id']))}")
+    method = payload.get("method")
+    parts.append(_trace_value(str(method)) if method else ("error" if "error" in payload else "result"))
+    if "sessionId" in payload:
+        parts.append(f"session={_trace_value(str(payload['sessionId']))}")
+    target_id = as_dict(params.get("targetInfo")).get("targetId")
+    for key, value in (*((key, params.get(key)) for key in TRACED_PARAMS), ("targetId", target_id)):
+        if isinstance(value, (str, int)):
+            parts.append(f"{key}={_trace_value(value)}")
+    return " ".join(parts)
+
+
+def _trace_value(value: str | int) -> str:
+    """Ids as they are; anything else quoted and cut short (the agent controls some of it)."""
+    text = str(value)
+    if TRACE_PLAIN.fullmatch(text):
+        return text
+    return repr(text[:TRACE_VALUE_MAX])
 
 
 class CdpConnection:

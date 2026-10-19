@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import socket
 import threading
@@ -420,6 +421,8 @@ def running_server(
 ) -> Iterator[dict[str, Any]]:
     """Start the proxy with a site (default: the test site); yields {base, ws, root, app}."""
     root = tmp_path_factory.mktemp("statelock")
+    # A failing browser test then shows its CDP traffic (methods and ids) in the captured log.
+    logging.getLogger("statelock.cdp").setLevel(logging.DEBUG)
     policy_path = root / "policy.yaml"
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
