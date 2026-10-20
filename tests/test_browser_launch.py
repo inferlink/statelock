@@ -316,8 +316,20 @@ def test_chromium_environment_keeps_only_what_chromium_needs() -> None:
 
 
 def _socket_inodes(pid: int) -> set[str]:
+    try:
+        fds = list(Path(f"/proc/{pid}/fd").iterdir())
+    except FileNotFoundError:  # exited since it was listed
+        return set()
+    except PermissionError:
+        # A helper that exited and is not reaped yet (a zombie) has no fds, and a non-root
+        # user may not list them. Any other process the test cannot read fails the test.
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        if stat.rsplit(") ", 1)[1][0] in "ZX":
+            return set()
+        cmdline = Path(f"/proc/{pid}/cmdline").read_text().replace("\0", " ")
+        raise AssertionError(f"cannot read the fds of Chromium process {pid}: {cmdline or stat}") from None
     inodes = set()
-    for fd in Path(f"/proc/{pid}/fd").iterdir():
+    for fd in fds:
         try:
             target = os.readlink(fd)
         except OSError:
