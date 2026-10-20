@@ -498,11 +498,12 @@ class CdpBridge:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
         if stalled in done:
+            diagnosis = await browser.diagnose()  # first: the browser's state at the stall
             # The agent's navigation (and any other waiting command) gets the reason, not a hang.
             for message_id, cdp_session_id in browser.multiplexer.unanswered(session.agent_channel):
                 request = {"id": message_id, **({"sessionId": cdp_session_id} if cdp_session_id else {})}
                 await session.respond(request, statelock_error(STALLED_CLOSE_REASON))
-            raise BrowserStalledError(f"Chromium stopped loading pages. {await browser.diagnose()}")
+            raise BrowserStalledError(f"Chromium stopped loading pages. {diagnosis}")
         for task in done:
             task.result()
 

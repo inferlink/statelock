@@ -82,6 +82,44 @@ CHROMIUM_ENV_NAMES = frozenset(
     }
 )
 CHROMIUM_ENV_PREFIXES = ("LC_", "XDG_")
+# Chromium as Playwright launches it, without the switches that weaken a site's security
+# (HTTPS upgrades, storage partitioning, popup blocking) or announce automation. Chromium
+# builds otherwise apply experimental field-trial features at random, run background
+# services (component updates, keyring access on Linux) that can hold up the first page
+# load, and restore back/forward pages without a request the guard could check.
+CHROMIUM_SWITCHES = (
+    "--disable-field-trial-config",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-back-forward-cache",
+    "--disable-breakpad",
+    "--disable-default-apps",
+    "--disable-extensions",
+    "--disable-dev-shm-usage",
+    "--metrics-recording-only",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--no-service-autorun",
+    "--password-store=basic",
+    "--use-mock-keychain",
+    "--disable-search-engine-choice-screen",
+    "--disable-features="
+    + ",".join(
+        (
+            "AcceptCHFrame",
+            "AutoDeElevate",
+            "AvoidUnnecessaryBeforeUnloadCheckSync",
+            "DestroyProfileOnBrowserClose",
+            "DialMediaRouteProvider",
+            "GlobalMediaControls",
+            "LensOverlay",
+            "MediaRouter",
+            "PaintHolding",
+            "RenderDocument",
+            "Translate",
+        )
+    ),
+)
 SANDBOX_HINT = (
     "Chromium could not start its sandbox. Run Statelock as a non-root user with a seccomp profile "
     "that allows user namespaces (compose.yaml does; see docker/README-sandbox.md), or set "
@@ -403,11 +441,9 @@ class ChromiumCdpLauncher:
             str(executable),
             "--headless=new",
             "--disable-gpu",
-            "--disable-dev-shm-usage",
-            "--no-first-run",
-            "--no-default-browser-check",
             "--remote-debugging-pipe",
             f"--user-data-dir={profile.path}",
+            *CHROMIUM_SWITCHES,
             "about:blank",
         ]
         if not self.sandbox:

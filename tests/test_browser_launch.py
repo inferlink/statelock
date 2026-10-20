@@ -183,6 +183,14 @@ def test_launch_uses_the_cdp_pipe_and_a_minimal_environment(tmp_path: Path, monk
 
     info = asyncio.run(scenario())
     assert "--remote-debugging-pipe" in info["args"]
+    # Chromium as Playwright runs it, keeping the site-security features on.
+    assert {"--disable-field-trial-config", "--password-store=basic", "--disable-back-forward-cache"} <= set(
+        info["args"]
+    )
+    disabled = next(arg for arg in info["args"] if arg.startswith("--disable-features=")).split("=", 1)[1].split(",")
+    assert "RenderDocument" in disabled
+    assert not {"HttpsUpgrades", "ThirdPartyStoragePartitioning"} & set(disabled)
+    assert not {"--disable-popup-blocking", "--enable-automation"} & set(info["args"])
     assert not any(arg.startswith("--remote-debugging-port") for arg in info["args"])
     assert "STATELOCK_PERCEPTION_API_KEY" not in info["env"]
     assert info["env"].get("LC_ALL") == "C.UTF-8" and "PATH" in info["env"]
