@@ -305,6 +305,10 @@ Reviewers use `http://<proxy>/review`, or the API with a reviewer key (`Authoriz
 
 Events `review_requested` and `review_decided` let plugins notify reviewers (for example in chat).
 
+### Policy Studio
+
+Policy Studio (experimental) helps draft a policy from tasks done by hand. Load Chrome Recorder JSON exports of runs the policy must allow and runs it must block (with the step and the reason), write the checks each step needs in your own words, discuss them with a model of your choice (through LiteLLM), and download a draft that passes Statelock's schema check. The raw recordings stay in the browser; you review each request before it is sent. Test a draft like any policy: start Statelock with it and run your agent on the same cases. It runs from a clone of this repository, natively or with Docker; see [tools/policy-studio/README.md](https://github.com/inferlink/statelock/blob/main/tools/policy-studio/README.md), and [examples/ojs/POLICY_STUDIO.md](https://github.com/inferlink/statelock/blob/main/examples/ojs/POLICY_STUDIO.md) for a walkthrough.
+
 ## Authentication
 
 Agents authenticate with API keys (`STATELOCK_AUTH_MODE=api_key`, the default). The keys file stores only SHA-256 hashes. `keygen --append` adds each entry under its section (and creates the file if it is missing); the key is printed on stderr:
@@ -629,14 +633,15 @@ src/statelock/
   settings.py, plugins.py, events.py, services.py, registry.py, wire.py, fileio.py
 tests/         unit tests; browser tests (test_browser_*.py, skipped without Chromium unless STATELOCK_REQUIRE_BROWSER=1);
                helpers (conftest.py, helpers.py, fakes.py, browser_support.py, ojs_support.py); fixtures/perception
-examples/      rogue_agent.py, finance_agent.py, portal_agent.py; ojs/ (Stagehand OJS agent, mock OJS site, its policy and custom rule);
-               ojs-ts/ (the OJS agent in TypeScript on Stagehand v3)
+examples/      rogue_agent.py, finance_agent.py, portal_agent.py; ojs/ (Stagehand OJS agent, mock OJS site, its policy and custom rule,
+               POLICY_STUDIO.md); ojs-ts/ (the OJS agent in TypeScript on Stagehand v3)
+tools/policy-studio/  Policy Studio (experimental, run from a clone): server.py, draft_with_model.py, core.js, studio.js; test/
 js/            @statelock/client: the JavaScript/TypeScript SDK; src/ index.ts, sessions.ts, violations.ts, cdp.ts,
                http.ts, mime.ts, playwright.ts (@statelock/client/playwright); test/
 policies/      default.yaml
 docker/        Dockerfile (targets: runtime, dev, ojs), seccomp profile, dev keys, dev secrets, README-sandbox.md
-compose.yaml   the proxy; compose.dev.yaml adds demos, demo agents, tests and the vlm profile
-.github/workflows/  ci.yml (lint, types, tests, extras, JS), dco.yml (sign-off check), release.yml (PyPI and GitHub release)
+compose.yaml   the proxy; compose.dev.yaml adds demos, demo agents, tests, the vlm profile and the policy-studio profile
+.github/workflows/  ci.yml (lint, types, tests, extras, Policy Studio, JS), dco.yml (sign-off check), release.yml (PyPI and GitHub release)
 ```
 
 ## Development
@@ -675,14 +680,14 @@ For a local development install:
 ```bash
 pip install -e ".[dev]"
 python -m playwright install chromium
-ruff check src tests examples && ruff format --check src tests examples && python -m mypy && python -m pytest -q
+ruff check src tests examples tools/policy-studio && ruff format --check src tests examples tools/policy-studio && python -m mypy && python -m pytest -q
 ```
 
 - The proxy runs on Linux and macOS (also under uvloop); Windows is not supported.
 - Python 3.10+ (the `browser-use` extra needs 3.11+). The Docker images use Python 3.12 (Playwright's Ubuntu 24.04 "noble" image). `mypy` is strict for `core` and `policy`.
 - The Docker image pins Playwright 1.64.0 (Chromium 156) and runs as `pwuser`. On Linux hosts, `./artifacts` must be writable by that user.
 - Injected JavaScript lives in `src/statelock/proxy/js/`.
-- CI (`.github/workflows/ci.yml`) also runs the browser tests with `STATELOCK_REQUIRE_BROWSER=1`, so they fail instead of skipping without Chromium, plus the extras' tests and the JavaScript SDK.
+- CI (`.github/workflows/ci.yml`) also runs the browser tests with `STATELOCK_REQUIRE_BROWSER=1`, so they fail instead of skipping without Chromium, plus the extras' tests, the Policy Studio tests and the JavaScript SDK.
 - Contributions: see [CONTRIBUTING.md](https://github.com/inferlink/statelock/blob/main/CONTRIBUTING.md). Every commit needs a DCO sign-off (`git commit -s`); a check on pull requests enforces it.
 - Security issues: see [SECURITY.md](https://github.com/inferlink/statelock/blob/main/SECURITY.md).
 - Releases: the manual Release workflow publishes `statelock-ai` to PyPI and creates the GitHub release (see [CONTRIBUTING.md](https://github.com/inferlink/statelock/blob/main/CONTRIBUTING.md#releases)).

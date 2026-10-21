@@ -25,8 +25,8 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Lint
         run: |
-          ruff check src tests examples
-          ruff format --check src tests examples
+          ruff check src tests examples tools/policy-studio
+          ruff format --check src tests examples tools/policy-studio
       - name: Type check
         run: python -m mypy
 
@@ -66,6 +66,25 @@ jobs:
         run: >-
           python -m pytest -q -rs
           tests/test_browser_browser_use.py tests/test_browser_langchain.py tests/test_example_ojs.py
+
+  # Policy Studio (tools/policy-studio): its server, with LiteLLM stubbed, and its browser-side logic.
+  policy-studio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install
+        run: pip install -e ".[dev,policy-studio]"
+      - name: Server tests
+        run: python -m pytest -q -rs tools/policy-studio/test/test_draft_with_model.py
+      - name: Browser logic tests
+        # A glob, not the directory: Node 22's --test does not search a directory argument.
+        run: node --test tools/policy-studio/test/*.test.js
 
   # The JavaScript SDK (js/) and the TypeScript OJS example. Their tests start the Python
   # test proxy (js/test/server.py, tests/browser_support.py), so the package and Chromium

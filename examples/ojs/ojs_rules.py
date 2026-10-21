@@ -48,6 +48,8 @@ def read_decision(decisions_file: Path, paper_id: int) -> dict[str, Any] | None:
 
 @register_rule
 class OjsDecision(Rule):
+    """The decision source says to decline this paper and, with email_field, has the email the page holds."""
+
     rule_name: ClassVar[str] = "ojs_decision"
     phases: ClassVar[frozenset[str]] = frozenset({"pre"})
     check_timeout: ClassVar[float | None] = 10.0

@@ -60,6 +60,8 @@ dev = [
 stagehand = ["stagehand>=0.4.1,<0.5"]
 # rule visual_assert with a vision-language model (STATELOCK_PERCEPTION_MODEL).
 vlm = ["litellm>=1.50"]
+# Policy Studio (tools/policy-studio), for running the tool from a clone; not part of the proxy runtime.
+policy-studio = ["litellm>=1.50"]
 # statelock.integrations.langchain: LangChain (and CrewAI) browser tools that stop on a violation.
 langchain = ["langchain-core>=0.3", "langchain-community>=0.3"]
 # statelock.integrations.browser_use: pass Statelock's CDP URL to browser-use (tested with 0.13).

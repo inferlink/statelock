@@ -32,9 +32,10 @@ FROM runtime AS dev
 USER root
 # browser-use too, so its tests (tests/test_browser_browser_use.py) run in this image, and litellm
 # (vlm) for visual_assert against a model (the perception-tests service).
-RUN python3 -m pip install -e "/src/statelock[dev,browser-use,vlm]"
+RUN python3 -m pip install -e "/src/statelock[dev,browser-use,vlm,policy-studio]"
 COPY tests /src/statelock/tests
 COPY examples /app/examples
+COPY tools/policy-studio /app/tools/policy-studio
 RUN chown -R pwuser:pwuser /app /src
 USER pwuser
 

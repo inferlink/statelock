@@ -23,3 +23,9 @@ js/dist/
 # Editor settings
 .idea/
 .vscode/
+
+# Local agent instructions
+AGENTS.md
+
+# Policy Studio drafts under test (tools/policy-studio/README.md)
+*.draft.yaml

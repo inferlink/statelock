@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="statelock-studio-token" content="{{token}}">
+  <meta name="statelock-studio-limits" content="{{limits}}">
+  <title>Statelock Policy Studio</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="core.js"></script>
+  <script defer src="studio.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><strong>Statelock</strong><span>Policy Studio</span><span class="draft-tag">Draft</span></div>
+    <div class="commands">
+      <button id="load-recording" class="button secondary" type="button">Load recording</button>
+      <input id="recording-file" type="file" accept=".json,application/json" hidden>
+      <input id="add-recording-file" type="file" accept=".json,application/json" hidden>
+      <button id="load-session" class="button secondary" type="button">Load draft session</button>
+      <input id="session-file" type="file" accept=".json,application/json" hidden>
+      <button id="export-session" class="button secondary" type="button" disabled>Export draft session</button>
+      <button id="download-yaml" class="button primary" type="button" disabled>Download YAML</button>
+    </div>
+  </header>
+  <div id="error" class="error" role="alert" hidden></div>
+  <div id="empty" class="empty">
+    <h1 id="empty-title">Load a Chrome recording</h1>
+    <p id="session-hint" hidden>Now choose the original Chrome recording for this draft session.</p>
+    <button id="choose-recording" class="button primary" type="button">Choose JSON file</button>
+  </div>
+
+  <main id="workspace" class="workspace" hidden>
+    <aside class="timeline" aria-label="Recorded steps">
+      <div class="timeline-heading">
+        <div class="run-picker">
+          <label for="run-select" class="eyebrow">Recording</label>
+          <select id="run-select"></select>
+          <div class="run-actions">
+            <button id="add-recording" class="button secondary" type="button">Add recording</button>
+            <button id="remove-recording" class="button secondary" type="button">Remove</button>
+          </div>
+        </div>
+        <h1 id="recording-title"></h1><p id="step-count" class="muted"></p>
+        <label class="run-kind">This run
+          <select id="run-kind">
+            <option value="pass">must pass: every action allowed</option>
+            <option value="block">must be blocked</option>
+          </select>
+        </label>
+        <div id="run-block" class="run-block" hidden>
+          <label for="run-description">Why it must be blocked</label>
+          <textarea id="run-description" rows="2" placeholder="The page shows submission 101, not the one in the URL."></textarea>
+          <p class="muted">Blocked at: <span id="block-step-label"></span></p>
+        </div>
+        <fieldset class="view-switch" aria-label="Step display">
+          <label><input type="radio" name="step-view" value="actions" checked><span>Actions</span></label>
+          <label><input type="radio" name="step-view" value="all"><span>All events</span></label>
+        </fieldset>
+      </div>
+      <ol id="step-list" class="step-list"></ol>
+    </aside>
+
+    <section class="detail" aria-label="Selected step">
+      <div id="sensitive-warning" class="notice" hidden>Recorded form values are hidden here. The original Chrome JSON may contain them.</div>
+      <nav class="step-nav" aria-label="Move between steps">
+        <button id="previous-step" class="button secondary" type="button">Previous</button>
+        <button id="next-step" class="button secondary" type="button">Next</button>
+      </nav>
+      <div class="step-header">
+        <p id="step-number" class="eyebrow"></p><h2 id="step-title"></h2>
+        <dl id="step-meta" class="step-meta"></dl>
+        <details id="selectors-panel"><summary>Recorded selectors</summary><ul id="selector-list"></ul></details>
+        <button id="mark-block" class="button secondary" type="button" hidden>Must be blocked at this step</button>
+      </div>
+      <div class="checks-header"><h3>Checks for this step</h3><span id="check-count" class="muted"></span></div>
+      <div id="notes-list" class="notes-list"></div>
+      <form id="note-form" class="note-form">
+        <fieldset class="phase-switch" aria-label="When to check">
+          <label><input type="radio" name="phase" value="before" checked><span>Before action</span></label>
+          <label><input type="radio" name="phase" value="after"><span>After action</span></label>
+        </fieldset>
+        <label for="note-text">What must be true?</label>
+        <textarea id="note-text" rows="3" placeholder="The paper ID on the page matches the URL."></textarea>
+        <div class="form-footer"><span class="muted">Describe the desired check in your own words</span><button class="button primary" type="submit">Add check</button></div>
+      </form>
+    </section>
+
+    <aside class="chat" aria-label="Policy drafting chat">
+      <div class="chat-heading"><p class="eyebrow">Policy draft</p><h2>Clarify and draft</h2></div>
+      <div id="draft-settings" class="chat-config" hidden>
+        <label>Agent ID for the policy<input id="agent-id" type="text" placeholder="ojs_screening_agent"></label>
+        <label>Page URL scope <span class="muted">(optional)</span><input id="page-scope" type="text" placeholder="/index.php/journal/"></label>
+      </div>
+      <div id="chat-history" class="chat-history" aria-live="polite"><p class="muted">Add checks to the timeline, then discuss them here.</p></div>
+      <div id="draft-status" class="draft-status" hidden></div>
+      <ul id="block-results" class="block-results" hidden></ul>
+      <details id="yaml-panel" hidden><summary>View validated YAML</summary><pre id="yaml-preview"></pre></details>
+      <form id="chat-form" class="chat-form">
+        <label for="chat-message">Your message</label>
+        <textarea id="chat-message" rows="3">Review these checks and tell me what needs clarification.</textarea>
+        <div class="chat-actions">
+          <button id="new-conversation" class="button secondary" type="button" disabled>New conversation</button>
+          <button id="draft-yaml" class="button secondary" type="button">Draft YAML</button>
+          <button id="review-request" class="button primary" type="submit">Send message</button>
+        </div>
+      </form>
+    </aside>
+  </main>
+  <dialog id="request-panel" class="request-dialog" aria-labelledby="request-title">
+    <h2 id="request-title">Send this information to your LLM?</h2>
+    <p>Your annotations, each recording's role (must pass, or must be blocked with your reason), a summary of each annotated step and block step (its label, recorded selectors, and page URLs without query strings), conversation, and policy settings will be sent to the configured model to discuss checks or draft YAML. Please review them for passwords, API keys, and other sensitive information before continuing.</p>
+    <p>The raw Chrome recordings, including the values typed into forms and their titles, stay in your browser.</p>
+    <p id="request-model" class="muted"></p>
+    <h3>Information to send</h3>
+    <pre id="request-data"></pre>
+    <details><summary>View the exact model request</summary><pre id="request-preview"></pre></details>
+    <p id="request-error" class="request-error" role="alert" hidden></p>
+    <div class="chat-actions">
+      <button id="cancel-request" class="button secondary" type="button">Cancel</button>
+      <button id="send-request" class="button primary" type="button" disabled>Send to model</button>
+    </div>
+  </dialog>
+  <footer class="footer">Local authoring tool. Before enforcing a draft, load it into Statelock and run your agent on the runs that must pass and must be blocked.</footer>
+</body>
+</html>

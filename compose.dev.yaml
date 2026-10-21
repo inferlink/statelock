@@ -18,6 +18,29 @@ x-agent-env: &agent-env
   PYTHONUNBUFFERED: "1"
 
 services:
+  # Standalone policy authoring UI. The raw Chrome recording stays in the host browser;
+  # only reviewed annotations, their step summaries and the chat are sent to the configured model.
+  # Run with: docker compose -f compose.dev.yaml --profile policy-studio up --build policy-studio
+  policy-studio:
+    image: statelock-dev
+    build: *dev-build
+    profiles: [policy-studio]
+    ports:
+      - "127.0.0.1:${STATELOCK_POLICY_STUDIO_PORT:-8765}:8765"
+    # A network of its own: the demo agents (some deliberately rogue) cannot reach it to spend the model key.
+    networks: [policy-studio]
+    # Lets STATELOCK_POLICY_STUDIO_API_BASE=http://host.docker.internal:11434 reach Ollama on the host (Linux too).
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    environment:
+      STATELOCK_POLICY_STUDIO_API_KEY: ${STATELOCK_POLICY_STUDIO_API_KEY:-}
+      # Empty means the default in tools/policy-studio/draft_with_model.py.
+      STATELOCK_POLICY_STUDIO_MODEL: ${STATELOCK_POLICY_STUDIO_MODEL:-}
+      STATELOCK_POLICY_STUDIO_API_BASE: ${STATELOCK_POLICY_STUDIO_API_BASE:-}
+      STATELOCK_POLICY_STUDIO_HOST: 0.0.0.0
+      # The OJS demo's custom rule (ojs_decision), as the statelock service loads it, so the model knows it.
+      STATELOCK_RULE_MODULES: /app/examples/ojs/ojs_rules.py
+    command: python /app/tools/policy-studio/server.py
+
   statelock:
     build: *dev-build
     image: statelock-dev
@@ -34,7 +57,8 @@ services:
     environment:
       - STATELOCK_POLICY_FILE=/app/policies/default.yaml
       # The OJS demo's policy and its custom rule (examples/ojs), next to the default policy.
-      - STATELOCK_EXTRA_POLICY_FILES=/app/examples/ojs/ojs_policy.yaml
+      # STATELOCK_OJS_POLICY_FILE swaps in a draft to test (examples/ojs/POLICY_STUDIO.md).
+      - STATELOCK_EXTRA_POLICY_FILES=${STATELOCK_OJS_POLICY_FILE:-/app/examples/ojs/ojs_policy.yaml}
       - STATELOCK_RULE_MODULES=/app/examples/ojs/ojs_rules.py
       - STATELOCK_ARTIFACT_DIR=/app/artifacts
       - STATELOCK_AUTH_KEYS_FILE=/app/keys.yaml
@@ -195,6 +219,8 @@ services:
       - ./docker/Dockerfile:/src/statelock/docker/Dockerfile:ro
       - ./compose.dev.yaml:/src/statelock/compose.dev.yaml:ro
       - ./examples:/src/statelock/examples:ro
+      # Policy Studio and its tests (run them by path: pytest's testpaths is tests/).
+      - ./tools:/src/statelock/tools:ro
     working_dir: /src/statelock
     command: python -m pytest -q -p no:cacheprovider
 
@@ -250,3 +276,6 @@ services:
 
 volumes:
   ollama-models:
+
+networks:
+  policy-studio:

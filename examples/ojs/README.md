@@ -116,6 +116,8 @@ To make each recorded rejection wait for an editor, add this rule:
 
 Each rejection then pauses until a reviewer approves or denies it at `/review`. Raise the agent's action timeout above `STATELOCK_REVIEW_TIMEOUT`: `OJS_ACTION_TIMEOUT` (seconds, default 360).
 
+To draft a policy like this one from recordings made in Chrome, and test it on the agent, follow the tutorial in [POLICY_STUDIO.md](POLICY_STUDIO.md) (experimental).
+
 ## Tests
 
 `tests/test_example_ojs.py` runs the agent against the mock journal through a real proxy and Chromium. It is skipped when Stagehand is not installed. It covers:

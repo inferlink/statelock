@@ -244,6 +244,8 @@ class ProhibitClickText(Rule):
 
 @register_rule
 class RequirePageText(Rule):
+    """The page text must contain every listed value."""
+
     rule_name: ClassVar[str] = "require_page_text"
 
     values: list[NonEmptyText] = Field(min_length=1)
