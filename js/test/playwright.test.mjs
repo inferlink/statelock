@@ -1,5 +1,6 @@
 // Playwright through Statelock: install(), connectPlaywright() and the session's file methods.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,8 +8,14 @@ import { after, before, test } from "node:test";
 
 import { chromium } from "playwright-core";
 
-import { StatelockDownloadError, StatelockPolicyViolationError, uploadFiles } from "../dist/index.js";
-import { connectPlaywright, install, statelockSession, uninstall } from "../dist/playwright.js";
+import {
+  StatelockDownloadError,
+  StatelockPolicyViolationError,
+  StatelockRequestError,
+  StatelockResponse,
+  uploadFiles,
+} from "../dist/index.js";
+import { StatelockDownload, connectPlaywright, install, statelockSession, uninstall } from "../dist/playwright.js";
 import { key, openSession, startServer } from "./helpers.mjs";
 
 let server;
@@ -16,6 +23,15 @@ before(async () => { server = await startServer(); });
 after(async () => { uninstall(); await server.stop(); });
 
 const pdf = (name) => ({ name, mimeType: "application/pdf", buffer: Buffer.from("%PDF-1") });
+const REPORT = Buffer.from("%PDF-1.4 quarterly report ".repeat(200)); // tests/browser_support.py FILES
+
+async function until(condition, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("timed out");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
 
 test("Playwright's own setInputFiles uploads through Statelock", async () => {
   const { session, page, close } = await openSession(server, "flow_agent", { install });
@@ -129,9 +145,110 @@ test("plain browsers are untouched", async () => {
     await page.setInputFiles("#f", { name: "a.txt", mimeType: "text/plain", buffer: Buffer.from("a") });
     assert.equal(await statelockSession(page), null);
     assert.equal(await page.innerText("#n"), "1");
+    // Straight to the site, not through Statelock: Playwright's own request and download event.
+    const response = await page.request.get(`${server.base}/gov/form`);
+    assert.ok(!(response instanceof StatelockResponse) && response.ok());
+    assert.match(await response.text(), /Form/);
+    const downloads = [];
+    page.on("download", (download) => downloads.push(download));
+    await page.goto(`${server.base}/gov/docs`);
+    await page.click("#pdf");
+    await until(() => downloads.length);
+    assert.ok(!(downloads[0] instanceof StatelockDownload));
+    assert.equal(downloads[0].suggestedFilename(), "report.pdf");
   } finally {
     await browser.close();
   }
+});
+
+test("page.on('download') gets the download Statelock checked; once() and off() work", async () => {
+  const { page, close } = await openSession(server, "flow_agent", { install });
+  try {
+    await page.goto(`${server.base}/gov/docs`);
+    const every = [];
+    const first = [];
+    const read = [];
+    const onDownload = (download) => every.push(download);
+    page.on("download", onDownload);
+    page.once("download", (download) => first.push(download));
+    page.on("download", async (download) => read.push(await download.readBytes()));
+    for (const count of [1, 2]) {
+      await page.click("#pdf");
+      await until(() => read.length === count);
+    }
+    page.off("download", onDownload);
+    await page.click("#pdf");
+    await until(() => read.length === 3);
+    assert.equal(every.length, 2); // removed before the third download
+    assert.equal(first.length, 1); // once
+    assert.deepEqual(read, [REPORT, REPORT, REPORT]);
+    assert.ok(every[0] instanceof StatelockDownload);
+    assert.equal(every[0].suggestedFilename(), "report.pdf");
+    assert.equal(every[0].sha256, createHash("sha256").update(REPORT).digest("hex"));
+    assert.notEqual(every[0].info.guid, every[1].info.guid);
+    const target = join(await mkdtemp(join(tmpdir(), "slt-")), "on.pdf");
+    await every[0].saveAs(target);
+    assert.deepEqual(await readFile(target), REPORT);
+  } finally {
+    await close();
+  }
+});
+
+test("page.on('download') goes to the page that started the download", async () => {
+  const { page, close } = await openSession(server, "flow_agent", { install });
+  try {
+    const other = await page.context().newPage();
+    const got = new Map([[page, []], [other, []]]);
+    for (const each of [page, other]) {
+      await each.goto(`${server.base}/gov/docs`);
+      each.on("download", (download) => got.get(each).push(download.page() === each && download.suggestedFilename()));
+    }
+    await other.click("#pdf");
+    await until(() => got.get(other).length);
+    await page.click("#pdf");
+    await until(() => got.get(page).length);
+    await new Promise((resolve) => setTimeout(resolve, 600)); // nothing more arrives
+    assert.deepEqual(got.get(page), ["report.pdf"]);
+    assert.deepEqual(got.get(other), ["report.pdf"]);
+  } finally {
+    await close();
+  }
+});
+
+test("page.request and context.request go through Statelock", async () => {
+  const { session, page, close } = await openSession(server, "request_agent", { install });
+  try {
+    await page.goto(`${server.base}/gov/cookies`); // the site sets its HttpOnly session cookie
+    const me = await page.request.get(`${server.base}/gov/me`);
+    assert.ok(me instanceof StatelockResponse);
+    assert.equal(me.status(), 200);
+    assert.deepEqual(await me.json(), { user: "signed-in" });
+    const json = await (await page.request.post(`${server.base}/gov/echo`, { data: { a: 1 } })).json();
+    assert.deepEqual([JSON.parse(json.body), json.content_type], [{ a: 1 }, "application/json"]);
+    const viaContext = await page.context().request.fetch(`${server.base}/gov/echo`, { method: "POST", form: { a: "1 2" } });
+    const form = await viaContext.json();
+    assert.deepEqual([form.body, form.content_type], ["a=1+2", "application/x-www-form-urlencoded"]);
+    // Declined: the session continues.
+    await assert.rejects(page.request.delete(`${server.base}/gov/me`), (error) => {
+      assert.ok(error instanceof StatelockRequestError, String(error));
+      assert.match(error.message, /no request_access rule/);
+      return true;
+    });
+    await assert.rejects(
+      page.request.get(`${server.base}/gov/me`, { maxRedirects: 2 }),
+      /not supported through Statelock: maxRedirects/,
+    );
+    assert.equal(await page.title(), "Cookies");
+  } finally {
+    await close();
+  }
+  const fetches = [];
+  const sessionDir = join(server.root, "artifacts", "sessions", session.sessionId);
+  for (const name of (await readdir(sessionDir)).filter((n) => n.startsWith("action-"))) {
+    const record = JSON.parse(await readFile(join(sessionDir, name, "context.json"), "utf8"));
+    if (record.context.method === "Statelock.fetch") fetches.push(record);
+  }
+  assert.equal(fetches.length, 4); // each request governed and recorded, the declined one too
 });
 
 test("uploads return the proxy's fields, mimeType included", async () => {

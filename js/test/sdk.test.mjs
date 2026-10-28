@@ -7,11 +7,14 @@ import { test } from "node:test";
 import {
   StatelockDownloadError,
   StatelockPolicyViolationError,
+  StatelockRequestError,
   StatelockResponse,
   guard,
+  statelockFetch,
   uploadFiles,
   waitForDownload,
 } from "../dist/index.js";
+import { frameDownloads, settledGuids } from "../dist/cdp.js";
 import { decodeViolation } from "../dist/violations.js";
 
 /** A CDP session that records uploaded bytes and answers Statelock.downloads with `downloads`. */
@@ -92,6 +95,50 @@ test("StatelockResponse has Playwright's APIResponse methods", async () => {
   assert.equal(new StatelockResponse({ status: 404 }).ok(), false);
 });
 
+test("statelockFetch: form, params, failOnStatusCode and errors", async () => {
+  const sent = [];
+  let answer = { status: 200 };
+  const cdp = {
+    async send(method, params) {
+      sent.push(params);
+      if (answer instanceof Error) throw answer;
+      return answer;
+    },
+  };
+  await statelockFetch(cdp, "https://x/y?a=1#f", { method: "post", form: { b: "1 2" }, params: { c: 3 } });
+  assert.equal(sent[0].url, "https://x/y?a=1&c=3#f");
+  assert.equal(sent[0].method, "POST");
+  assert.equal(sent[0].headers["Content-Type"], "application/x-www-form-urlencoded");
+  assert.equal(Buffer.from(sent[0].body, "base64").toString(), "b=1+2");
+  await statelockFetch(cdp, "https://x/y", { params: "d=4", data: { e: 5 }, headers: { "content-type": "text/x" } });
+  assert.equal(sent[1].url, "https://x/y?d=4");
+  assert.deepEqual(sent[1].headers, { "content-type": "text/x" });
+  answer = { status: 404, statusText: "Not Found", url: "https://x/y" };
+  assert.equal((await statelockFetch(cdp, "https://x/y")).status(), 404);
+  await assert.rejects(statelockFetch(cdp, "https://x/y", { failOnStatusCode: true }), StatelockRequestError);
+  answer = new Error("Statelock declined the request: no request_access rule");
+  await assert.rejects(statelockFetch(cdp, "https://x/y"), (error) => error instanceof StatelockRequestError);
+  answer = new Error('STATELOCK_POLICY_VIOLATION {"rule":"secret_injection"}');
+  await assert.rejects(statelockFetch(cdp, "https://x/y"), (error) => error === answer); // guard() converts it
+});
+
+test("frameDownloads: a page's completed downloads, by frame", () => {
+  const entry = (guid, frameId, state = "completed") =>
+    ({ guid, frameId, state, name: `${guid}.pdf`, url: "u", size: 1, sha256: "s" });
+  const entries = [
+    entry("seen", "F1"), entry("mine", "F1"), entry("child", "F2"), entry("other", "X"),
+    entry("running", "F1", "in_progress"), entry("blocked", "F1", "blocked"), entry("unframed", null),
+  ];
+  const split = (unattributed) => frameDownloads(entries, new Set(["seen"]), new Set(["F1", "F2"]), unattributed);
+  let { mine, others } = split(false);
+  assert.deepEqual(mine.map((d) => d.guid), ["mine", "child"]);
+  assert.deepEqual(mine[0], { guid: "mine", name: "mine.pdf", url: "u", size: 1, sha256: "s", frameId: "F1" });
+  assert.deepEqual(others.map((d) => d.guid), ["other", "unframed"]);
+  ({ mine, others } = split(true));
+  assert.deepEqual(mine.map((d) => d.guid), ["mine", "child", "unframed"]);
+  assert.deepEqual(others.map((d) => d.guid), ["other"]);
+});
+
 test("decodeViolation reads the full and the compact form", () => {
   assert.deepEqual(decodeViolation('x STATELOCK_POLICY_VIOLATION {"rule":"r","reason":"a {b}"} y'), { rule: "r", reason: "a {b}" });
   assert.deepEqual(decodeViolation('STATELOCK_POLICY_VIOLATION {"t":"pre","r":"x","s":"id","n":3}'), {
@@ -152,4 +199,9 @@ test("guard: a violation the watcher found is not looked up again", async () => 
   } finally {
     await stub.close();
   }
+});
+
+test("settledGuids: only finished downloads are old to a new listener", () => {
+  const entries = ["completed", "blocked", "canceled", "in_progress", "checking"].map((state) => ({ guid: state, state }));
+  assert.deepEqual([...settledGuids(entries)].sort(), ["blocked", "canceled", "completed"]);
 });

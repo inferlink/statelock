@@ -21,6 +21,7 @@ class Patches:
     def __init__(self, patches: Sequence[Patch]) -> None:
         self._patches = patches
         self._originals: dict[tuple[type, str], Any] = {}
+        self._inherited: set[tuple[type, str]] = set()  # restored by removing the replacement
 
     def original(self, cls: type, name: str) -> Any:
         return self._originals[(cls, name)]
@@ -29,11 +30,17 @@ class Patches:
         for cls, name, replacement in self._patches:
             if (cls, name) not in self._originals:
                 self._originals[(cls, name)] = getattr(cls, name)
+                if name not in cls.__dict__:
+                    self._inherited.add((cls, name))
                 setattr(cls, name, replacement)
 
     def uninstall(self) -> None:
         for (cls, name), original in list(self._originals.items()):
-            setattr(cls, name, original)
+            if (cls, name) in self._inherited:
+                delattr(cls, name)
+                self._inherited.discard((cls, name))
+            else:
+                setattr(cls, name, original)
             del self._originals[(cls, name)]
 
 

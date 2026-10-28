@@ -54,8 +54,10 @@ class Harness:
         for _ in range(5):
             await asyncio.sleep(0.01)
 
-    async def download(self, guid: str, data: bytes, name: str = "a.pdf") -> None:
-        self.event("Browser.downloadWillBegin", guid=guid, url=f"https://portal.test/{name}", suggestedFilename=name)
+    async def download(self, guid: str, data: bytes, name: str = "a.pdf", **begin: Any) -> None:
+        self.event(
+            "Browser.downloadWillBegin", guid=guid, url=f"https://portal.test/{name}", suggestedFilename=name, **begin
+        )
         await self.settle()
         (self.downloads.root / guid).write_bytes(data)
         self.event(
@@ -67,6 +69,30 @@ class Harness:
     async def listing(self) -> dict[str, dict[str, Any]]:
         result = await self.downloads.handle("Statelock.downloads", {})
         return {d["guid"]: d for d in result["downloads"]}
+
+
+def test_listing_gives_each_downloads_fields_and_frame(tmp_path: Path) -> None:
+    async def scenario():
+        h = Harness(tmp_path)
+        await h.download("g1", b"abc", frameId="F1")
+        await h.download("g2", b"de", "b.pdf")  # Chromium gave no frame
+        listing = await h.listing()
+        await h.downloads.close()
+        return listing
+
+    listing = run(scenario())
+    assert listing["g1"] == {
+        "guid": "g1",
+        "name": "a.pdf",
+        "url": "https://portal.test/a.pdf",
+        "frameId": "F1",
+        "state": "completed",
+        "size": 3,
+        "sha256": hashlib.sha256(b"abc").hexdigest(),
+        "reason": None,
+        "rule": None,
+    }
+    assert listing["g2"]["frameId"] is None
 
 
 def test_configure_sets_statelock_folder_and_honours_deny(tmp_path: Path) -> None:

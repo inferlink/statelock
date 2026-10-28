@@ -5,13 +5,13 @@ Statelock client for JavaScript and TypeScript agents (Node 20+):
 - session URLs, with saved logins;
 - violation errors;
 - governed uploads and downloads;
-- governed HTTP requests (`statelockFetch`, policy `request_access`).
+- governed HTTP requests (`statelockFetch`, or Playwright's own `page.request` after `install()`; policy `request_access`).
 
 An agent needs no other Statelock code.
 
 It is not yet on npm: build it from this folder (`npm ci` runs the build), and depend on it by path (`"@statelock/client": "file:../statelock/js"`), as `examples/ojs-ts` does.
 
-The names match the Python SDK's, in JavaScript case (`statelock_session` is `statelockSession`, `expect_download` is `expectDownload`, ...). Compared with the Python SDK, it does not patch Playwright's `page.request` (use `statelockFetch`), has no `form`/`params` request options or request error class (a declined request rejects with the CDP error), and has no LangChain wrapper. `page.waitForEvent("download")` and `expectDownload` count downloads that start after the wait starts; start the wait together with the click, as the example does.
+The names match the Python SDK's, in JavaScript case (`statelock_session` is `statelockSession`, `expect_download` is `expectDownload`, ...). Compared with the Python SDK, it has no LangChain wrapper. `page.waitForEvent("download")` and `expectDownload` count downloads that start after the wait starts; start the wait together with the click, as the example does.
 
 ```ts
 import { chromium } from "playwright-core";
@@ -47,23 +47,24 @@ From `@statelock/client` (any CDP framework):
 | `secret(name)` | The placeholder `{{secret:name}}` for credential injection. |
 | `uploadFiles(cdp, files)`, `setFileInputFiles(cdp, node, files)` | Governed uploads over any CDP session. A file is a path or `{ name, mimeType, buffer }`; `buffer` is a Buffer, TypedArray, DataView, ArrayBuffer or string (UTF-8), anything else is a `TypeError`. A path's MIME type comes from its extension (the same table as the Python SDK). Each stored file is `{ path, name, size, sha256, mimeType }`. |
 | `knownDownloads(cdp)`, `waitForDownload(cdp, known, timeoutMs)`, `readDownload(cdp, info)` | Governed downloads over any CDP session. `timeoutMs` defaults to 30000; 0 waits without a limit. A blocked download throws `StatelockPolicyViolationError` with the rule Statelock reports (`null` if none); `guard` completes it with the recorded violation. |
-| `statelockFetch(cdp, url, { method, headers, data })` | Governed HTTP: Statelock makes the request in the page, with the browser's session (policy `request_access`). Header values may use `secret()`. Returns a `StatelockResponse` with Playwright's `APIResponse` methods: `status()`, `statusText()`, `ok()`, `url()`, `headers()`, `headersArray()`, and async `body()`, `text()`, `json()`. |
+| `statelockFetch(cdp, url, { method, headers, data, form, params, failOnStatusCode })` | Governed HTTP: Statelock makes the request in the page, with the browser's session (policy `request_access`). Header values may use `secret()`; `form` is sent URL-encoded, `params` are added to the query. Returns a `StatelockResponse` with Playwright's `APIResponse` methods: `status()`, `statusText()`, `ok()`, `url()`, `headers()`, `headersArray()`, and async `body()`, `text()`, `json()`, `dispose()`. A declined request (or a non-2xx status with `failOnStatusCode`) throws `StatelockRequestError`; when the session ended, the error is thrown as is for `guard`. |
+| `listDownloads(cdp)` | The session's download entries: `guid`, `name`, `url`, `frameId` (the frame it began in, or `null`), `state`, `size`, `sha256`, `reason`, `rule`. |
 | `cdpSender(x)` | A CDP session from a Playwright/Puppeteer `CDPSession` or a Stagehand v3 page (`sendCDP`). |
-| `StatelockPolicyViolationError`, `StatelockClientError`, `StatelockDownloadError` | The error classes: a violation; a request Statelock refused or could not answer (`status`); a download that was canceled or did not complete in time. |
+| `StatelockPolicyViolationError`, `StatelockClientError`, `StatelockDownloadError`, `StatelockRequestError` | The error classes: a violation; a request Statelock refused or could not answer (`status`); a download that was canceled or did not complete in time; a governed HTTP request Statelock declined or could not make. |
 
 From `@statelock/client/playwright`:
 
 | Function | What it does |
 |---|---|
 | `connectPlaywright(chromium, { serverUrl, apiKey, agentId, ttlSeconds, savedSession, saveSession, connectOptions })` | A session URL, connected over CDP. Returns `{ session, browser, page, guard(fn), setInputFiles(target, files, { page, timeout }), expectDownload({ page, predicate, timeout }), close() }`; `connectOptions` go to `connectOverCDP`. `page` defaults to the first page. |
-| `install(browser)`, `uninstall()` | Playwright's `setInputFiles` (Page, Locator, ElementHandle), `FileChooser.setFiles` (from `page.waitForEvent("filechooser")` or a `page.on("filechooser")` listener) and `page.waitForEvent("download")` go through Statelock; `uninstall()` restores them. Options Statelock cannot honour (`strict: false`, unknown ones) are refused, not dropped. Browsers not behind Statelock are untouched. |
+| `install(browser)`, `uninstall()` | Playwright's `setInputFiles` (Page, Locator, ElementHandle), `FileChooser.setFiles` (from `page.waitForEvent("filechooser")` or a `page.on("filechooser")` listener) and `page.waitForEvent("download")` go through Statelock; `page.on("download")` (and `once`, `addListener`, ...) listeners receive each download Statelock checked that began in the page or one of its frames (polled every 250 ms while the page has listeners); `page.request` / `context.request` (`get`, `post`, `put`, `patch`, `delete`, `head`, `fetch`) of this browser's contexts make governed requests in the context's first page (`statelockFetch`; `multipart`, `maxRedirects`, `maxRetries`, `ignoreHTTPSErrors` are refused). `uninstall()` restores them. Options Statelock cannot honour (`strict: false`, unknown ones) are refused, not dropped. Browsers not behind Statelock are untouched. |
 | `setInputFiles(page, target, files, { timeout })` | A governed upload into a file input of the page's main frame (`target`: a selector, Locator or ElementHandle). |
 | `expectDownload(page, { predicate, timeout })` | The next download the page starts that `predicate` accepts, after Statelock checked it: a `StatelockDownload` (`saveAs`, `path`, `readBytes`, `suggestedFilename`, `url`, `sha256`). `timeout` defaults to the page's or context's `setDefaultTimeout` (set after `install()`), else 30000; 0 waits without a limit. |
 | `statelockSession(page)` | `{ session_id, agent_id }` if the page's browser is behind Statelock, else `null`. |
 
 ## Frameworks
 
-- **Playwright (`playwright-core` 1.40+).** `connectOverCDP(session.cdpUrl)` connects. Call `install(browser)` for the file APIs. `page.on("download")` listeners are not covered.
+- **Playwright (`playwright-core` 1.40+).** `connectOverCDP(session.cdpUrl)` connects. Call `install(browser)` for the file APIs, download listeners and `page.request`.
 - **Stagehand v3 (3.7).** `new Stagehand({ env: "LOCAL", localBrowserLaunchOptions: { cdpUrl: session.wsUrl } })` connects. Its clicks are real CDP input, so they are governed like any click. It has no download API, so use `cdpSender(page)` with `waitForDownload` / `readDownload`. When the connection closes, Stagehand v3 leaves pending calls unsettled, and `session.guard` reports the violation anyway. See `examples/ojs-ts`.
 - **Stagehand v4 is not supported.** Its driver runs as a Chrome extension inside the browser, not over CDP, so a CDP proxy cannot govern it.
 - **Puppeteer.** `puppeteer.connect({ browserURL: session.cdpUrl })` connects. Use the CDP helpers with `page.createCDPSession()`.

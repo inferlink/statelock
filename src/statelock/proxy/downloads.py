@@ -17,9 +17,10 @@ A blocked download is cancelled (or deleted) and ends the session, like any
 violation. The file reaches the agent only after both checks pass, over the
 agent's own CDP connection:
 
-- ``Statelock.downloads`` {} -> {downloads: [{guid, name, url, state, size, sha256, reason, rule}]}
-  (``rule``: for a blocked download, the policy rule that blocked it, or ``download_limit``
-  for a size limit; null when allowed or when a check could not run)
+- ``Statelock.downloads`` {} -> {downloads: [{guid, name, url, frameId, state, size, sha256, reason, rule}]}
+  (``frameId``: the frame the download began in, null if Chromium gave none; ``rule``: for
+  a blocked download, the policy rule that blocked it, or ``download_limit`` for a size
+  limit; null when allowed or when a check could not run)
 - ``Statelock.downloadRead`` {guid, offset, length} -> {data (base64), eof}
 
 The client SDK wraps this in ``statelock.client.expect_download``. Files are
@@ -115,6 +116,7 @@ class DownloadInfo:
             "guid": self.guid,
             "name": self.name,
             "url": self.url,
+            "frameId": self.frame_id,
             "state": self.state.value,
             "size": self.size,
             "sha256": self.sha256,

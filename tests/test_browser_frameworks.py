@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from collections.abc import Iterator
@@ -81,6 +82,32 @@ def test_connect_playwright_is_the_short_path(server: dict[str, Any], installed:
             return governed.session.agent_id, title, governed.browser.is_connected()
 
     assert asyncio.run(steps()) == (AGENT, "Form", False)  # leaving the block closed the connection
+
+
+def test_a_new_context_with_its_own_user_agent_is_governed(server: dict[str, Any]) -> None:
+    """Playwright's context options work through Statelock as on a plain browser: the
+    site sees the context's User-Agent, and the context's actions are still checked."""
+    user_agent = "Mozilla/5.0 (StatelockTest) Chrome/156.0.0.0 Safari/537.36"
+
+    async def steps() -> tuple[str, str, StatelockPolicyViolationError]:
+        async with playwright_api.async_playwright() as p:
+            key = agent_key("finance_reconciliation_agent")
+            async with await statelock.client.connect_playwright(p, server["base"], api_key=key) as governed:
+                context = await governed.browser.new_context(user_agent=user_agent)
+                page = await context.new_page()
+                await page.goto(server["base"] + "/gov/user-agent")
+                sent = json.loads(await page.inner_text("body"))["user_agent"]
+                reported = await page.evaluate("navigator.userAgent")
+                with pytest.raises(StatelockPolicyViolationError) as raised:
+                    async with governed.guard():
+                        await page.goto(server["base"] + "/demo/finance?scenario=mismatch")
+                        await page.click("text=Mark as Paid")
+                        await page.title()
+            return sent, reported, raised.value
+
+    sent, reported, violation = asyncio.run(steps())
+    assert sent == reported == user_agent
+    assert violation.rule == "assert_field_equal"
 
 
 def test_guard_names_the_rule_with_the_sessions_key(server: dict[str, Any]) -> None:
@@ -341,3 +368,141 @@ def test_expect_download_honours_the_default_timeout(server: dict[str, Any]) -> 
     finally:
         statelock.client.uninstall_sync()
     assert 1.4 < waited < 15  # the context's 1.5 s, not the 30 s default
+
+
+async def _until(condition: Any, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        await asyncio.sleep(0.05)
+
+
+def test_page_on_download_gets_the_checked_download(server: dict[str, Any], installed: None, tmp_path: Path) -> None:
+    url = _session_url(server)
+
+    async def steps(page: Any) -> dict[str, Any]:
+        await page.goto(server["base"] + "/gov/docs")
+        every: list[Any] = []
+        first: list[Any] = []
+        read: list[bytes] = []
+
+        def on_download(download: Any) -> None:
+            every.append(download)
+
+        async def read_it(download: Any) -> None:
+            read.append(await download.read_bytes())
+
+        page.on("download", on_download)
+        page.once("download", lambda download: first.append(download))  # noqa: PLW0108 - Playwright cannot take list.append
+        page.on("download", read_it)
+        page.on("download", lambda: None)  # takes no argument, as Playwright allows
+        for _ in range(2):
+            count = len(read)
+            await page.click("#pdf")
+            await _until(lambda count=count: len(read) == count + 1)
+        page.remove_listener("download", on_download)
+        await page.click("#pdf")
+        await _until(lambda: len(read) == 3)
+        saved = await every[0].save_as(tmp_path / "on.pdf")
+        return {"every": every, "first": first, "read": read, "saved": Path(saved).read_bytes()}
+
+    result = asyncio.run(_with_page(url.cdp_url, steps))
+    assert len(result["every"]) == 2  # removed before the third download
+    assert len(result["first"]) == 1  # once
+    assert result["read"] == [FILES["report.pdf"]] * 3
+    assert result["saved"] == FILES["report.pdf"]
+    download = result["every"][0]
+    assert isinstance(download, statelock.client.StatelockDownload)
+    assert download.suggested_filename == "report.pdf"
+    assert download.sha256 == hashlib.sha256(FILES["report.pdf"]).hexdigest()
+    assert len({d.guid for d in result["every"]}) == 2
+
+
+def test_page_on_download_goes_to_the_page_that_started_it(server: dict[str, Any], installed: None) -> None:
+    url = _session_url(server)
+
+    async def steps(page: Any) -> tuple[list[str], list[str]]:
+        other = await page.context.new_page()
+        got: dict[Any, list[str]] = {page: [], other: []}
+        for each in (page, other):
+            await each.goto(server["base"] + "/gov/docs")
+            each.on("download", lambda d, each=each: got[each].append(d.page is each and d.suggested_filename))
+        await other.click("#pdf")
+        await _until(lambda: got[other])
+        # A frame the page gains after its listener started is still the page's. (A download
+        # from an iframe is captured from the tab heuristically, which takes a few seconds.)
+        await page.goto(server["base"] + "/gov/framed")
+        await page.frame_locator("#docs").locator("#pdf").click()
+        await _until(lambda: got[page])
+        await asyncio.sleep(0.6)  # nothing more arrives
+        return got[page], got[other]
+
+    assert asyncio.run(_with_page(url.cdp_url, steps)) == (["report.pdf"], ["report.pdf"])
+
+
+def test_page_on_download_on_a_plain_browser_is_playwrights(installed: None, server: dict[str, Any]) -> None:
+    if not chromium_available():
+        pytest.skip("Playwright Chromium is not installed")
+
+    async def steps() -> list[Any]:
+        async with playwright_api.async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                got: list[Any] = []
+                page.on("download", lambda download: got.append(download))  # noqa: PLW0108
+                await page.goto(server["base"] + "/gov/docs")  # straight to the site, not through Statelock
+                await page.click("#pdf")
+                await _until(lambda: got)
+                return got
+            finally:
+                await browser.close()
+
+    got = asyncio.run(steps())
+    assert len(got) == 1 and isinstance(got[0], playwright_api.Download)
+
+
+def test_sync_page_request_goes_through_statelock(server: dict[str, Any]) -> None:
+    statelock.client.install_sync()
+    try:
+        with (
+            playwright_sync_api.sync_playwright() as p,
+            statelock.client.connect_playwright_sync(p, server["base"], api_key=agent_key("request_agent")) as governed,
+        ):
+            page = governed.page
+            page.goto(server["base"] + "/gov/cookies")  # the site sets its HttpOnly session cookie
+            me = page.request.get(server["base"] + "/gov/me")
+            echoed = page.request.post(server["base"] + "/gov/echo", form={"a": "1"})
+            via_context = page.context.request.fetch(server["base"] + "/gov/me")
+            with pytest.raises(statelock.client.StatelockRequestError, match="no request_access rule"):
+                page.request.delete(server["base"] + "/gov/me")
+            with pytest.raises(statelock.client.StatelockRequestError, match="not supported"):
+                page.request.get(server["base"] + "/gov/me", max_redirects=2)
+            title = page.title()  # the session continues
+            session_id = governed.session.session_id
+    finally:
+        statelock.client.uninstall_sync()
+    assert isinstance(me, statelock.client.StatelockResponseSync)
+    assert (me.status, me.ok, me.json()) == (200, True, {"user": "signed-in"})
+    assert echoed.json()["body"] == "a=1"
+    assert echoed.json()["content_type"] == "application/x-www-form-urlencoded"
+    assert via_context.json() == {"user": "signed-in"}
+    assert title == "Cookies"
+    fetches = [r for r in actions(server, session_id) if r["context"]["method"] == "Statelock.fetch"]
+    assert [r["verdict"]["decision"] for r in fetches][:3] == ["allow", "allow", "allow"]
+
+
+def test_sync_page_request_on_a_plain_browser_is_playwrights(server: dict[str, Any]) -> None:
+    statelock.client.install_sync()
+    try:
+        with playwright_sync_api.sync_playwright() as p:
+            browser = p.chromium.launch()
+            try:
+                page = browser.new_page()
+                response = page.request.get(server["base"] + "/gov/form")
+                assert isinstance(response, playwright_sync_api.APIResponse)
+                assert response.ok and "Form" in response.text()
+            finally:
+                browser.close()
+    finally:
+        statelock.client.uninstall_sync()
