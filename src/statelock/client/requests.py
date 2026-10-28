@@ -121,6 +121,7 @@ def _encode_body(
 def _request_command(
     url: str,
     method: str,
+    *,
     headers: dict[str, str] | None,
     data: Any,
     form: dict[str, Any] | None,
@@ -159,7 +160,7 @@ async def statelock_fetch(
     data: bytes, text, or a JSON-serializable value (sent as JSON). form: sent URL-encoded.
     Header values may use {{secret:name}} placeholders (credential injection).
     """
-    command = _request_command(url, method, headers, data, form, params)
+    command = _request_command(url, method, headers=headers, data=data, form=form, params=params)
     async with cdp_session(page) as cdp:
         try:
             result = await cdp.send(REQUEST_COMMAND, command)
@@ -182,7 +183,7 @@ def statelock_fetch_sync(
     fail_on_status_code: bool = False,
 ) -> StatelockResponseSync:
     """``statelock_fetch`` for Playwright's sync API."""
-    command = _request_command(url, method, headers, data, form, params)
+    command = _request_command(url, method, headers=headers, data=data, form=form, params=params)
     with cdp_session_sync(page) as cdp:
         try:
             result = cdp.send(REQUEST_COMMAND, command)
