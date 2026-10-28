@@ -149,6 +149,8 @@ SITE = {
 <a id=exe href="/gov/files/tool.exe">Download tool</a>
 <a id=big href="/gov/files/big.bin">Download archive</a>
 </body></html>""",
+    "/gov/framed": """<html><head><title>Framed</title></head><body>
+<iframe id=docs src="/gov/docs"></iframe></body></html>""",
     "/gov/drag": """<html><head><title>Drag</title></head><body>
 <div id=item draggable=true style="width:80px;height:40px">Item</div>
 <div id=zone style="width:200px;height:100px;margin-top:40px">Drop here</div><p id=dropstatus>waiting</p>
@@ -227,7 +229,11 @@ def site_router() -> APIRouter:
     async def large() -> Response:
         return Response(b"x" * 300_000, media_type="application/octet-stream")
 
+    async def user_agent(request: Request) -> JSONResponse:
+        return JSONResponse({"user_agent": request.headers.get("user-agent")})
+
     router.add_api_route("/gov/me", me, methods=["GET"])
+    router.add_api_route("/gov/user-agent", user_agent, methods=["GET"])
     router.add_api_route("/gov/echo", echo, methods=["POST"])
     router.add_api_route("/gov/large", large, methods=["GET"])
     for name, to in (("me", "/gov/me"), ("away", "/gov/form"), ("plain", "/gov/me")):

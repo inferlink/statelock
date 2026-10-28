@@ -7,9 +7,11 @@
 
 After ``install_sync()``, on a browser connected through Statelock, ``set_input_files``
 (Page, Locator, ElementHandle) and ``FileChooser.set_files`` upload through Statelock,
-and ``page.expect_download()`` returns the download Statelock checked (default timeout:
-the page's or context's ``set_default_timeout``, else 30 s). ``page.request`` is not
-covered for the sync API.
+``page.expect_download()`` returns the download Statelock checked (default timeout:
+the page's or context's ``set_default_timeout``, else 30 s), and ``page.request`` /
+``context.request`` make governed requests (see statelock.client.requests).
+``page.on("download")`` listeners are not covered for the sync API: use
+``page.expect_download()``.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from playwright.sync_api import BrowserContext, ElementHandle, FileChooser, Loca
 
 from statelock.client import files_sync, patching, transfer
 from statelock.client.files_sync import set_input_files_sync, statelock_session_sync
+from statelock.client.requests import GovernedRequestContextSync
 
 
 class _ExpectDownloadSync:
@@ -84,6 +87,17 @@ def _page_expect_download(self: Page, predicate: Any = None, timeout: float | No
     return _ExpectDownloadSync(self, predicate, timeout)
 
 
+def _page_request(self: Page) -> GovernedRequestContextSync:
+    return GovernedRequestContextSync(lambda: self, _patches.original(Page, "request").fget(self))
+
+
+def _context_request(self: BrowserContext) -> GovernedRequestContextSync:
+    return GovernedRequestContextSync(
+        lambda: self.pages[0] if self.pages else None,
+        _patches.original(BrowserContext, "request").fget(self),
+    )
+
+
 def _page_set_default_timeout(self: Page, timeout: float) -> None:
     patching.record_default_timeout(self, timeout)
     _patches.original(Page, "set_default_timeout")(self, timeout)
@@ -103,12 +117,14 @@ _patches = patching.Patches(
         (Page, "expect_download", _page_expect_download),
         (Page, "set_default_timeout", _page_set_default_timeout),
         (BrowserContext, "set_default_timeout", _context_set_default_timeout),
+        (Page, "request", property(_page_request)),
+        (BrowserContext, "request", property(_context_request)),
     )
 )
 
 
 def install_sync() -> None:
-    """Route sync Playwright's upload and download APIs through Statelock (idempotent)."""
+    """Route sync Playwright's upload, download and request APIs through Statelock (idempotent)."""
     _patches.install()
 
 

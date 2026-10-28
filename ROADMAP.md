@@ -18,9 +18,9 @@ What Statelock does today and what is planned next. [COVERAGE.md](https://github
 
 ## Planned
 
-- Playwright gaps: `page.on("download")` listeners and sync `page.request` through Statelock.
+- Playwright gaps: sync `page.on("download")` listeners through Statelock (today: `page.expect_download()`).
 - Governed HTTP redirects with a destination check before each redirected request; redirects currently fail closed.
-- The JavaScript SDK on npm, and Playwright JS `page.request` through Statelock (today: `statelockFetch`).
+- The JavaScript SDK on npm.
 - CI coverage of every extra (the CrewAI conversion is not yet tested in CI).
 - Structured logs, metrics and tracing; load tests for concurrent sessions.
 - Durable storage for reviews, so pending reviews and their history survive a restart.

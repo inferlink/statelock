@@ -22,9 +22,11 @@ export {
 export { StatelockPolicyViolationError, guard, type GuardOptions, type Violation } from "./violations.js";
 export {
   StatelockDownloadError,
+  StatelockRequestError,
   StatelockResponse,
   cdpSender,
   knownDownloads,
+  listDownloads,
   readDownload,
   setFileInputFiles,
   statelockFetch,

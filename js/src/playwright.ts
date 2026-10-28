@@ -16,9 +16,16 @@
  *   files through Statelock, as governed uploads;
  * - page.waitForEvent("download") resolves with the download Statelock checked, and
  *   it works like Playwright's Download (saveAs, path, suggestedFilename, url). Its
- *   default timeout is the page's (or context's) setDefaultTimeout, else 30 s.
- * Without install(), the session from connectPlaywright has the same two:
- * governed.setInputFiles(target, files) and governed.expectDownload().
+ *   default timeout is the page's (or context's) setDefaultTimeout, else 30 s;
+ * - page.on("download") (once, addListener, ...) listeners receive each download
+ *   Statelock checked that began in the page or one of its frames: a watcher per page
+ *   polls Statelock.downloads while the page has download listeners, and emits the
+ *   page's own "download" event (which Playwright never fires on a governed page);
+ * - page.request and context.request make their requests through Statelock, in the
+ *   context's first page, if the agent's policy allows them (request_access).
+ * Without install(), the session from connectPlaywright has
+ * governed.setInputFiles(target, files) and governed.expectDownload(), and
+ * statelockFetch makes governed requests.
  *
  * FileChooser is not reachable before a page opens one, so install() hooks the page's
  * event emitter: each "filechooser" event's FileChooser class is patched before any
@@ -26,7 +33,7 @@
  *
  * Other browsers are untouched: each is asked once whether it is a Statelock session.
  * install() patches Playwright's classes, so it needs one live browser to find them.
- * Not covered: page.on("download") listeners.
+ * page.request / context.request are governed only for browsers passed to install().
  */
 
 import { mkdtemp, open, rm } from "node:fs/promises";
@@ -34,6 +41,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 import type {
+  APIRequestContext,
   Browser,
   BrowserContext,
   BrowserType,
@@ -46,24 +54,36 @@ import type {
 
 import {
   DEFAULT_DOWNLOAD_TIMEOUT_MS,
+  DOWNLOAD_EVENT_POLL_MS,
   type DownloadInfo,
+  type FetchOptions,
+  StatelockRequestError,
   type StatelockSessionInfo,
   type UploadFile,
   type UploadedFile,
+  frameDownloads,
+  frameIds,
   knownDownloads,
+  listDownloads,
   sessionInfo,
+  settledGuids,
+  statelockFetch,
   streamDownload,
   uploadFiles,
   waitForDownload,
 } from "./cdp.js";
 import { type SessionUrl, type SessionUrlOptions, createSessionUrl } from "./sessions.js";
-import { StatelockPolicyViolationError } from "./violations.js";
+import { StatelockPolicyViolationError, mayBeViolation } from "./violations.js";
 
 const MARKER_ATTRIBUTE = "data-statelock-upload-target";
 const UPLOAD_OPTIONS = new Set(["timeout", "noWaitAfter", "strict"]);
 
 type AnyFunction = (...args: any[]) => any;
 const originals = new Map<object, Map<string, AnyFunction>>();
+/** Patched names a prototype only inherited: uninstall() removes the patch instead of assigning. */
+const inherited = new Map<object, Set<string>>();
+/** The browsers install() was given: page.request / context.request are governed only for them. */
+const installedBrowsers = new Set<Browser>();
 const governed = new WeakMap<object, Promise<StatelockSessionInfo | null>>();
 /** Timeouts set with Page/BrowserContext.setDefaultTimeout while installed (Playwright has no getter). */
 const defaultTimeouts = new WeakMap<object, number>();
@@ -294,7 +314,12 @@ function patch(prototype: object, name: string, make: (original: AnyFunction) =>
   if (!methods) originals.set(prototype, (methods = new Map()));
   if (methods.has(name)) return;
   const original = (prototype as Record<string, AnyFunction>)[name];
+  if (typeof original !== "function") return;
   methods.set(name, original);
+  if (!Object.prototype.hasOwnProperty.call(prototype, name)) {
+    if (!inherited.has(prototype)) inherited.set(prototype, new Set());
+    inherited.get(prototype)!.add(name);
+  }
   (prototype as Record<string, AnyFunction>)[name] = make(original);
 }
 
@@ -322,7 +347,141 @@ function recordDefaultTimeout(original: AnyFunction): AnyFunction {
   };
 }
 
-/** Route Playwright's upload and download APIs through Statelock (idempotent). */
+// page.on("download") ---------------------------------------------------------------------
+
+interface Watcher {
+  cdp?: CDPSession;
+  timer?: NodeJS.Timeout;
+  stopped: boolean;
+}
+
+const watchers = new Map<Page, Watcher>();
+
+type PageEmitter = { listenerCount(event: string): number; emit(event: string, ...args: unknown[]): boolean };
+
+/** The page as an event emitter (Playwright's Page is one; its public type does not say so). */
+function emitter(page: Page): PageEmitter {
+  return page as unknown as PageEmitter;
+}
+
+/** Whether no other page of the page's context has download listeners (for a download with no frame). */
+function onlyListeningPage(page: Page): boolean {
+  return page
+    .context()
+    .pages()
+    .every((other) => other === page || !emitter(other).listenerCount("download"));
+}
+
+function stopWatcher(page: Page): void {
+  const watcher = watchers.get(page);
+  if (!watcher) return;
+  watchers.delete(page);
+  watcher.stopped = true;
+  if (watcher.timer) clearTimeout(watcher.timer);
+  watcher.cdp?.detach().catch(() => undefined);
+}
+
+/** One watcher per page with download listeners: it emits the page's "download" event with each
+ *  new download Statelock checked that began in one of the page's frames. */
+function startWatcher(page: Page): void {
+  if (watchers.has(page)) return;
+  const watcher: Watcher = { stopped: false };
+  watchers.set(page, watcher);
+  const done = (error?: unknown): void => {
+    if (error !== undefined && !watcher.stopped && !page.isClosed() && !mayBeViolation(error)) {
+      console.warn(`statelock: page.on("download") stopped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (watchers.get(page) === watcher) stopWatcher(page);
+    else watcher.cdp?.detach().catch(() => undefined);
+  };
+  (async () => {
+    if (!(await statelockSession(page))) return done(); // a plain browser: Playwright's own event fires
+    const cdp = (watcher.cdp = await page.context().newCDPSession(page));
+    if (watcher.stopped) return done();
+    // Only finished downloads are old: one still running when the listener was added is delivered.
+    const seen = settledGuids(await listDownloads(cdp));
+    let frames = await frameIds(cdp);
+    const tick = async (): Promise<void> => {
+      if (watcher.stopped) return;
+      if (page.isClosed() || !emitter(page).listenerCount("download")) return done();
+      try {
+        const entries = await listDownloads(cdp);
+        const unattributed = onlyListeningPage(page);
+        let { mine, others } = frameDownloads(entries, seen, frames, unattributed);
+        if (others.some((item) => item.frameId)) {
+          frames = await frameIds(cdp); // perhaps a frame the page gained since
+          ({ mine, others } = frameDownloads(entries, seen, frames, unattributed));
+        }
+        for (const item of others) seen.add(String(item.guid));
+        for (const info of mine) {
+          seen.add(info.guid);
+          if (watcher.stopped) break;
+          try {
+            emitter(page).emit("download", new StatelockDownload(page, info));
+          } catch (error) {
+            console.error(error); // a listener threw: the others and the watcher go on
+          }
+        }
+      } catch (error) {
+        return done(error);
+      }
+      if (!watcher.stopped) watcher.timer = setTimeout(tick, DOWNLOAD_EVENT_POLL_MS).unref();
+    };
+    await tick();
+  })().catch(done);
+}
+
+// page.request / context.request ------------------------------------------------------------
+
+type RequestOptions = FetchOptions & Record<string, unknown>;
+
+/** Each patched APIRequestContext method, with the HTTP method it sends (fetch: options.method). */
+const REQUEST_METHODS: Record<string, string | null> = {
+  get: "GET",
+  post: "POST",
+  put: "PUT",
+  patch: "PATCH",
+  delete: "DELETE",
+  head: "HEAD",
+  fetch: null,
+};
+const UNSUPPORTED_REQUEST_OPTIONS = ["multipart", "maxRedirects", "maxRetries", "ignoreHTTPSErrors"];
+
+/** The page to make a governed request in: the first page of the installed browser context whose
+ *  request this is, if that browser is behind Statelock; else null (Playwright's own request). */
+async function governedRequestPage(request: APIRequestContext): Promise<Page | null> {
+  for (const browser of installedBrowsers) {
+    const context = browser.contexts().find((each) => each.request === request);
+    if (!context) continue;
+    const page = context.pages()[0];
+    return page && (await statelockSession(page)) ? page : null;
+  }
+  return null;
+}
+
+/** Playwright's request options as statelockFetch options; refuses what Statelock cannot do. */
+function requestOptions(options: RequestOptions | undefined, method: string): FetchOptions {
+  const given = options ?? {};
+  const unsupported = UNSUPPORTED_REQUEST_OPTIONS.filter(
+    (name) => given[name] !== undefined && given[name] !== null && given[name] !== false,
+  );
+  if (unsupported.length) throw new StatelockRequestError(`not supported through Statelock: ${unsupported.join(", ")}`);
+  const { headers, data, form, params, failOnStatusCode } = given;
+  const plainObject = typeof form === "object" && form !== null && Object.getPrototypeOf(form) === Object.prototype;
+  if (form !== undefined && !plainObject) {
+    throw new StatelockRequestError("form through Statelock takes a plain object");
+  }
+  return {
+    method,
+    headers,
+    data,
+    form,
+    params: params instanceof URLSearchParams ? params.toString() : params,
+    failOnStatusCode,
+  };
+}
+
+/** Route Playwright's upload, download and request APIs through Statelock (idempotent). */
 export async function install(browser: Browser): Promise<void> {
   // A page to find Playwright's classes on; what install() had to open, it closes again.
   const existing = browser.contexts()[0];
@@ -334,6 +493,7 @@ export async function install(browser: Browser): Promise<void> {
   const contextProto = Object.getPrototypeOf(context);
   const locatorProto = Object.getPrototypeOf(page.locator("html"));
   const handleProto = Object.getPrototypeOf(handle);
+  const requestProto = Object.getPrototypeOf(context.request);
   await handle.dispose();
   if (!existing) await context.close();
   else if (!hadPage) await page.close();
@@ -376,6 +536,38 @@ export async function install(browser: Browser): Promise<void> {
   );
   patch(pageProto, "setDefaultTimeout", recordDefaultTimeout);
   patch(contextProto, "setDefaultTimeout", recordDefaultTimeout);
+  for (const name of ["on", "addListener", "prependListener", "once"]) {
+    patch(pageProto, name, (original) =>
+      function (this: Page, event: string | symbol, listener: AnyFunction) {
+        const result = original.call(this, event, listener);
+        if (event === "download") startWatcher(this);
+        return result;
+      },
+    );
+  }
+  for (const name of ["off", "removeListener"]) {
+    patch(pageProto, name, (original) =>
+      function (this: Page, event: string | symbol, listener: AnyFunction) {
+        const result = original.call(this, event, listener);
+        if (event === "download" && !emitter(this).listenerCount("download")) stopWatcher(this);
+        return result;
+      },
+    );
+  }
+  for (const [name, method] of Object.entries(REQUEST_METHODS)) {
+    patch(requestProto, name, (original) =>
+      async function (this: APIRequestContext, urlOrRequest: unknown, options?: RequestOptions) {
+        const page = await governedRequestPage(this);
+        if (!page) return original.call(this, urlOrRequest, options);
+        if (typeof urlOrRequest !== "string") {
+          throw new StatelockRequestError(`request.${name} through Statelock takes a URL string`);
+        }
+        const fetchOptions = requestOptions(options, method ?? options?.method ?? "GET");
+        return withCdp(page, (cdp) => statelockFetch(cdp, urlOrRequest, fetchOptions));
+      },
+    );
+  }
+  installedBrowsers.add(browser);
   patch(pageProto, "emit", (original) =>
     function (this: Page, event: string | symbol, ...args: unknown[]) {
       if (event === "filechooser" && args[0]) patchFileChooser(args[0]);
@@ -387,9 +579,15 @@ export async function install(browser: Browser): Promise<void> {
 /** Restore Playwright's own methods. */
 export function uninstall(): void {
   for (const [prototype, methods] of originals) {
-    for (const [name, original] of methods) (prototype as Record<string, AnyFunction>)[name] = original;
+    for (const [name, original] of methods) {
+      if (inherited.get(prototype)?.has(name)) delete (prototype as Record<string, AnyFunction>)[name];
+      else (prototype as Record<string, AnyFunction>)[name] = original;
+    }
   }
   originals.clear();
+  inherited.clear();
+  installedBrowsers.clear();
+  for (const page of [...watchers.keys()]) stopWatcher(page);
 }
 
 export interface ConnectPlaywrightOptions extends SessionUrlOptions {

@@ -16,17 +16,17 @@
 
 After ``install()``, Playwright's own file APIs work on the governed page:
 ``set_input_files`` and ``FileChooser.set_files`` upload through Statelock (as
-governed uploads), and ``page.expect_download()`` returns the download once
-Statelock has checked it. Without ``install()``, the session object has the same
+governed uploads), and ``page.expect_download()`` and ``page.on("download")``
+listeners get the download once Statelock has checked it. Without ``install()``, the session object has the same
 two methods: ``governed.set_input_files(target, files)`` and
 ``governed.expect_download()``.
 
 The async API is the default. Most of it has a sync version with the same name
 ending in ``_sync`` (functions) or ``Sync`` (classes): ``install_sync``,
 ``connect_playwright_sync``, ``PlaywrightSessionSync``, ``statelock_guard_sync``,
-``expect_download_sync``, ``StatelockDownloadSync``, ... ``statelock_fetch`` is async
-only; ``create_session_url`` and the saved-session functions are plain blocking
-calls that both APIs use.
+``expect_download_sync``, ``StatelockDownloadSync``, ``statelock_fetch_sync``, ...
+``create_session_url`` and the saved-session functions are plain blocking calls that
+both APIs use. ``page.on("download")`` listeners work after ``install()`` (async only).
 """
 
 from __future__ import annotations
@@ -53,7 +53,13 @@ from statelock.client.playwright import (
     connect_playwright,
     connect_playwright_sync,
 )
-from statelock.client.requests import StatelockRequestError, StatelockResponse, statelock_fetch
+from statelock.client.requests import (
+    StatelockRequestError,
+    StatelockResponse,
+    StatelockResponseSync,
+    statelock_fetch,
+    statelock_fetch_sync,
+)
 from statelock.client.sessions import (
     SessionUrl,
     StatelockClientError,
@@ -77,6 +83,7 @@ __all__ = [
     "StatelockPolicyViolationError",
     "StatelockRequestError",
     "StatelockResponse",
+    "StatelockResponseSync",
     "UploadFile",
     "connect_playwright",
     "connect_playwright_sync",
@@ -90,6 +97,7 @@ __all__ = [
     "set_input_files",
     "set_input_files_sync",
     "statelock_fetch",
+    "statelock_fetch_sync",
     "statelock_guard",
     "statelock_guard_sync",
     "statelock_session",

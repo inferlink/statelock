@@ -12,6 +12,9 @@ After ``install()``, on a browser connected through Statelock (by any framework)
   value works like Playwright's Download (``save_as``, ``path``,
   ``suggested_filename``, ``url``). Its default timeout is the page's
   ``set_default_timeout`` (or its context's) when set after ``install()``, else 30 s;
+- ``page.on("download")`` / ``page.once("download")`` listeners receive each download
+  Statelock checked that began in the page (or one of its frames), as the same
+  Download-like value (see statelock.client.download_events);
 - ``page.request`` and ``context.request`` make their requests through
   Statelock, in the page with the browser's session, if the agent's policy
   allows them (``request_access``; see statelock.client.requests).
@@ -19,7 +22,6 @@ After ``install()``, on a browser connected through Statelock (by any framework)
 Other browsers are untouched: the first call on a browser asks it whether it is a
 Statelock session (the ``Statelock.session`` command) and remembers the answer.
 Playwright's async API; ``install_sync()`` (install_sync.py) covers the sync API.
-``page.on("download")`` listeners are not covered.
 """
 
 from __future__ import annotations
@@ -30,8 +32,8 @@ from typing import Any
 
 from playwright.async_api import BrowserContext, ElementHandle, FileChooser, Locator, Page
 
+from statelock.client import download_events, patching, transfer
 from statelock.client import files as client_files
-from statelock.client import patching, transfer
 from statelock.client.files import statelock_session
 from statelock.client.requests import GovernedRequestContext
 
@@ -111,6 +113,25 @@ def _context_request(self: BrowserContext) -> GovernedRequestContext:
     )
 
 
+def _page_on(self: Page, event: str, f: Any) -> None:
+    # Always Playwright's too: on a governed page its download event never fires.
+    _patches.original(Page, "on")(self, event, f)
+    if event == "download":
+        download_events.add(self, f)
+
+
+def _page_once(self: Page, event: str, f: Any) -> None:
+    _patches.original(Page, "once")(self, event, f)
+    if event == "download":
+        download_events.add(self, f, once=True)
+
+
+def _page_remove_listener(self: Page, event: str, f: Any) -> None:
+    _patches.original(Page, "remove_listener")(self, event, f)
+    if event == "download":
+        download_events.remove(self, f)
+
+
 def _page_set_default_timeout(self: Page, timeout: float) -> None:
     patching.record_default_timeout(self, timeout)
     _patches.original(Page, "set_default_timeout")(self, timeout)
@@ -130,6 +151,9 @@ _patches = patching.Patches(
         (Page, "expect_download", _page_expect_download),
         (Page, "set_default_timeout", _page_set_default_timeout),
         (BrowserContext, "set_default_timeout", _context_set_default_timeout),
+        (Page, "on", _page_on),
+        (Page, "once", _page_once),
+        (Page, "remove_listener", _page_remove_listener),
         (Page, "request", property(_page_request)),
         (BrowserContext, "request", property(_context_request)),
     )
@@ -144,4 +168,5 @@ def install() -> None:
 def uninstall() -> None:
     """Restore Playwright's own methods."""
     _patches.uninstall()
+    download_events.stop_all()
     client_files.forget_sessions()

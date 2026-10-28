@@ -181,3 +181,48 @@ def test_the_mime_table_is_the_js_sdks() -> None:
         pytest.skip("js/src/mime.ts is not available")
     js = dict(re.findall(r'"(\.[a-z0-9]+)": "([^"]+)"', JS_MIME_TABLE.read_text(encoding="utf-8")))
     assert js == transfer.MIME_TYPES
+
+
+def test_frame_downloads_split_a_pages_completed_downloads() -> None:
+    entries = [
+        _settled("seen", frameId="F1"),
+        _settled("mine", frameId="F1"),
+        _settled("child", frameId="F2"),
+        _settled("other", frameId="X"),
+        _settled("running", "in_progress", frameId="F1"),
+        _settled("blocked", "blocked", frameId="F1"),
+        _settled("unframed", frameId=None),
+    ]
+    mine, others = transfer.frame_downloads(entries, {"seen"}, {"F1", "F2"}, unattributed=False)
+    assert [info.guid for info in mine] == ["mine", "child"]
+    assert mine[0] == transfer.DownloadInfo(guid="mine", name="mine.pdf", url="u", size=1, sha256="s")
+    assert [item["guid"] for item in others] == ["other", "unframed"]
+    mine, others = transfer.frame_downloads(entries, {"seen"}, {"F1", "F2"}, unattributed=True)
+    assert [info.guid for info in mine] == ["mine", "child", "unframed"]
+    assert [item["guid"] for item in others] == ["other"]
+
+
+def test_frame_ids_come_from_the_whole_frame_tree() -> None:
+    steps = transfer.frame_ids_steps()
+    assert next(steps) == transfer.Command("Page.getFrameTree")
+    tree = {
+        "frameTree": {
+            "frame": {"id": "main"},
+            "childFrames": [{"frame": {"id": "a"}, "childFrames": [{"frame": {"id": "b"}}]}, {"frame": {}}],
+        }
+    }
+    with pytest.raises(StopIteration) as done:
+        steps.send(tree)
+    assert done.value.value == {"main", "a", "b"}
+    assert transfer.frame_tree_ids({}) == set()
+
+
+def test_only_finished_downloads_are_old_to_a_new_listener() -> None:
+    entries = [
+        {"guid": "done", "state": "completed"},
+        {"guid": "stopped", "state": "blocked"},
+        {"guid": "gone", "state": "canceled"},
+        {"guid": "running", "state": "in_progress"},
+        {"guid": "hashing", "state": "checking"},
+    ]
+    assert transfer.settled_guids(entries) == {"done", "stopped", "gone"}

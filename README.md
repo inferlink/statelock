@@ -153,7 +153,7 @@ An agent that needs HTTP (a site's JSON API, a file behind a link) can have Stat
 ```
 
 ```python
-statelock.client.install()                                   # then Playwright's own page.request works:
+statelock.client.install()                                   # then Playwright's own page.request works (install_sync() too):
 invoices = await (await page.request.get("https://portal.example.com/api/invoices")).json()
 # or without install(): await statelock_fetch(page, url, method="POST", data={...})
 ```
@@ -167,6 +167,7 @@ invoices = await (await page.request.get("https://portal.example.com/api/invoice
 - **Secrets.** Header values may use `{{secret:name}}` (for example `Authorization: Bearer {{secret:api_token}}`). The secret needs `password_fields_only: false`, and the request URL must be in its scope (see [Credentials](https://github.com/inferlink/statelock/blob/main/README.md#credentials)). A placeholder that is not allowed ends the session (`secret_injection`), and the value is removed from the response if the endpoint echoes it.
 - **Concurrent.** A request runs alongside the agent's other commands, at most `STATELOCK_MAX_CONCURRENT_REQUESTS` (4) at once per session. One more is declined (`request_concurrency`, `StatelockRequestError`) and recorded; the session continues.
 - **Not supported** through `page.request`: `multipart`, `max_redirects`, `max_retries`, `ignore_https_errors`.
+- **Which page.** `page.request` runs in that page; `context.request` in the context's first page.
 
 ### Fields and remembered values
 
@@ -376,7 +377,7 @@ except StatelockPolicyViolationError as violation:
 
 The guard looks the violation up with the key the session was created with (else `STATELOCK_API_KEY`). If Statelock refuses that key or cannot be reached, it raises `StatelockClientError` (with `status`) instead of reporting no violation.
 
-The sync API has the same names ending in `_sync` / `Sync` (`install_sync`, `connect_playwright_sync`, `statelock_guard_sync`, `expect_download_sync`, ...). `statelock_fetch` is async only; `create_session_url` and the saved-session functions are plain blocking calls that both APIs use:
+The sync API has the same names ending in `_sync` / `Sync` (`install_sync`, `connect_playwright_sync`, `statelock_guard_sync`, `expect_download_sync`, `statelock_fetch_sync`, ...). `create_session_url` and the saved-session functions are plain blocking calls that both APIs use:
 
 ```python
 import statelock.client
@@ -387,6 +388,13 @@ with statelock.client.connect_playwright_sync(playwright) as governed, governed.
 ```
 
 Under the hood, Statelock uses a CDP browser URL. Any framework that takes such a URL (Playwright, Puppeteer, browser-use, Stagehand, LangChain or CrewAI browser tools) can use one.
+
+The session's browser is headless Chromium with Chromium's defaults: the same build and launch switches as Playwright's, so a site sees what it would see from Playwright with no options set (for example a `HeadlessChrome` User-Agent). Statelock has no browser settings of its own. Playwright's context options (`user_agent`, `locale`, `viewport`, `timezone_id`, ...) work as on any browser: open a context with them, and Statelock governs its pages like the first one.
+
+```python
+context = await governed.browser.new_context(user_agent=MY_USER_AGENT)
+page = await context.new_page()
+```
 
 After an action that navigates (a click on a submit button, Enter in a form), wait for its result (a URL, an element) rather than for `networkidle`. Statelock returns the action once it has checked the policy's post-conditions, and by then the next page may already be idle, so a wait that only listens for a new `networkidle` event can miss it.
 
@@ -472,12 +480,13 @@ What no SDK can stop: plain HTTP from the agent's own process (for example `requ
 
 - **Uploads:** `set_input_files` (on a page, locator or element handle) and `FileChooser.set_files` upload the files through Statelock. The upload is governed, and the file's name, size and SHA-256 are recorded.
 - **Downloads:** `page.expect_download()` waits for the download Statelock checked. A download is checked when it begins (the page's policies, including `restrict_downloads`) and when it completes (size, SHA-256). Its value works like Playwright's Download (`save_as`, `path`, `suggested_filename`, `url`). Its default timeout is the page's `set_default_timeout`, as in Playwright.
+- **Download listeners** (async API): `page.on("download")` / `page.once("download")` listeners receive the same value for each download Statelock checked that began in the page or one of its frames. While a page has listeners, the client polls Statelock every 0.25 s. A blocked download ends the session, so it is never handed to a listener.
 - **Other browsers are untouched:** each browser is asked once whether it is a Statelock session (`Statelock.session`).
 - **Without `install()`:** the session object has the same two methods: `governed.set_input_files(target, files, page=None, timeout=None)` and `governed.expect_download(predicate=None, page=None, timeout=None)` (`page` defaults to `governed.page`); also `statelock.client.set_input_files(page, target, files)` and `statelock.client.expect_download(page, predicate=None, timeout=None)`. `timeout` is in milliseconds, as in Playwright: by default the page's or context's `set_default_timeout` (set after `install()`), else 30000; 0 waits without a limit. A blocked download raises `StatelockPolicyViolationError` with the rule Statelock reports; a guard adds the recorded violation. A `buffer` must be bytes-like or str; anything else raises `TypeError`. A path's MIME type comes from its extension (the same table as the JS SDK).
 
 Limits (see the [roadmap](https://github.com/inferlink/statelock/blob/main/ROADMAP.md)):
 
-- `page.on("download")` listeners are not covered, and `install_sync()` does not cover sync `page.request` yet.
+- Sync `page.on("download")` listeners are not covered: use `page.expect_download()`.
 - File inputs inside iframes are not supported yet (main frame only).
 - Upload rules (`restrict_uploads`) check name, extension, size and count, not file contents.
 - File contents are not stored with the evidence. Only name, size and SHA-256 are recorded, and uploaded files are deleted when the session ends.

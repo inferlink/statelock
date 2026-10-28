@@ -13,7 +13,7 @@ Upload: ``Statelock.uploadFileBegin`` {name, mimeType} -> {uploadId}; one
 file input is found for the CDP session through a temporary marker attribute,
 then filled with ``DOM.setFileInputFiles``.
 
-Download: ``Statelock.downloads`` lists the session's downloads (guid, state, ...);
+Download: ``Statelock.downloads`` lists the session's downloads (guid, frameId, state, ...);
 ``Statelock.downloadRead`` {guid, offset, length} -> {data (base64), eof} streams a
 completed one, checked against its SHA-256.
 """
@@ -26,7 +26,7 @@ import os
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generic, TypeVar
@@ -45,6 +45,7 @@ from statelock.wire import (
 CHUNK_BYTES = 4 * 1024 * 1024
 UPLOAD_MARKER_ATTRIBUTE = "data-statelock-upload-target"
 DOWNLOAD_POLL_INTERVAL = 0.1
+DOWNLOAD_EVENT_POLL_INTERVAL = 0.25  # page.on("download") watchers poll less often: they may run all session
 DEFAULT_DOWNLOAD_TIMEOUT_MS = 30_000
 # Chromium's answer to a method it does not have ("'Statelock.session' wasn't found").
 UNKNOWN_COMMAND_TEXT = "wasn't found"
@@ -325,9 +326,64 @@ def first_new_download(entries: Iterable[dict[str, Any]], known: set[Any]) -> Do
     return None
 
 
+def frame_downloads(
+    entries: Iterable[dict[str, Any]], seen: set[Any], frame_ids: Collection[str], *, unattributed: bool
+) -> tuple[list[DownloadInfo], list[dict[str, Any]]]:
+    """Split the completed downloads not in ``seen``: (those of a page whose frames are
+    ``frame_ids``, the other entries). A download without a frameId is the page's only
+    when ``unattributed``. Downloads still running, blocked or canceled are in neither."""
+    mine: list[DownloadInfo] = []
+    others: list[dict[str, Any]] = []
+    for item in entries:
+        if item.get("state") != "completed" or item.get("guid") in seen:
+            continue
+        frame_id = item.get("frameId")
+        if frame_id in frame_ids if frame_id else unattributed:
+            info = settle(item)
+            assert info is not None  # noqa: S101 - a completed entry settles
+            mine.append(info)
+        else:
+            others.append(item)
+    return mine, others
+
+
+def downloads_steps() -> Steps[list[dict[str, Any]]]:
+    """The session's download entries."""
+    return download_entries((yield Command(DOWNLOADS_COMMAND)))
+
+
+def frame_ids_steps() -> Steps[set[str]]:
+    """The ids of the page's frames (on the CDP session's page)."""
+    return frame_tree_ids((yield Command("Page.getFrameTree")))
+
+
+def frame_tree_ids(result: dict[str, Any]) -> set[str]:
+    """The frame ids in a ``Page.getFrameTree`` answer."""
+    ids: set[str] = set()
+    pending = [result.get("frameTree")]
+    while pending:
+        node = pending.pop()
+        if not isinstance(node, dict):
+            continue
+        frame_id = (node.get("frame") or {}).get("id")
+        if isinstance(frame_id, str):
+            ids.add(frame_id)
+        pending.extend(node.get("childFrames") or [])
+    return ids
+
+
+# Downloads still running when a listener starts: they are new to it when they complete.
+UNSETTLED_STATES = frozenset({"in_progress", "checking"})
+
+
+def settled_guids(entries: Iterable[dict[str, Any]]) -> set[Any]:
+    """The guids of the downloads that have finished (completed, blocked or canceled)."""
+    return {item.get("guid") for item in entries if item.get("state") not in UNSETTLED_STATES}
+
+
 def known_downloads_steps() -> Steps[set[Any]]:
     """The guids Statelock already has: the download to wait for is the next one."""
-    return {d.get("guid") for d in download_entries((yield Command(DOWNLOADS_COMMAND)))}
+    return {d.get("guid") for d in (yield from downloads_steps())}
 
 
 def wait_for_download_steps(known: set[Any], timeout: float) -> Steps[DownloadInfo]:

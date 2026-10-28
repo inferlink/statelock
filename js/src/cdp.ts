@@ -12,7 +12,7 @@ import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
 
 import { mimeType } from "./mime.js";
-import { StatelockPolicyViolationError } from "./violations.js";
+import { StatelockPolicyViolationError, mayBeViolation } from "./violations.js";
 
 /** Per CDP message; stays well under the proxy's 16 MiB WebSocket message limit. */
 const CHUNK_BYTES = 4 * 1024 * 1024;
@@ -25,6 +25,8 @@ const DOWNLOADS_COMMAND = "Statelock.downloads";
 const DOWNLOAD_READ_COMMAND = "Statelock.downloadRead";
 const REQUEST_COMMAND = "Statelock.fetch";
 const DOWNLOAD_POLL_MS = 100;
+/** page.on("download") watchers poll less often: they may run all session. */
+export const DOWNLOAD_EVENT_POLL_MS = 250;
 export const DEFAULT_DOWNLOAD_TIMEOUT_MS = 30_000;
 /** Chromium's answer to a method it does not have ("'Statelock.session' wasn't found"). */
 const UNKNOWN_COMMAND_TEXT = "wasn't found";
@@ -142,15 +144,71 @@ export interface DownloadInfo {
   url: string;
   size: number;
   sha256: string;
+  /** The frame the download began in (null if Chromium gave none). */
+  frameId: string | null;
 }
 
-async function listDownloads(cdp: CdpSender): Promise<Record<string, unknown>[]> {
+/** The session's download entries (Statelock.downloads): guid, name, url, frameId, state, size, sha256, ... */
+export async function listDownloads(cdp: CdpSender): Promise<Record<string, unknown>[]> {
   const result = await send(cdp, DOWNLOADS_COMMAND);
   const downloads = result.downloads;
   return Array.isArray(downloads) ? downloads.filter((d) => d && typeof d === "object") : [];
 }
 
+function completedInfo(item: Record<string, unknown>): DownloadInfo {
+  return {
+    guid: String(item.guid),
+    name: String(item.name),
+    url: String(item.url),
+    size: Number(item.size ?? 0),
+    sha256: String(item.sha256),
+    frameId: typeof item.frameId === "string" ? item.frameId : null,
+  };
+}
+
+/**
+ * Split the completed downloads not in `seen`: those of a page whose frames are `frameIds`,
+ * and the other entries. A download without a frameId is the page's only when
+ * `unattributed`. Downloads still running, blocked or canceled are in neither.
+ */
+export function frameDownloads(
+  entries: Record<string, unknown>[],
+  seen: Set<string>,
+  frameIds: Set<string>,
+  unattributed: boolean,
+): { mine: DownloadInfo[]; others: Record<string, unknown>[] } {
+  const mine: DownloadInfo[] = [];
+  const others: Record<string, unknown>[] = [];
+  for (const item of entries) {
+    if (item.state !== "completed" || seen.has(String(item.guid))) continue;
+    const frameId = typeof item.frameId === "string" && item.frameId ? item.frameId : null;
+    if (frameId ? frameIds.has(frameId) : unattributed) mine.push(completedInfo(item));
+    else others.push(item);
+  }
+  return { mine, others };
+}
+
+/** The frame ids of the CDP session's page (Page.getFrameTree). */
+export async function frameIds(cdp: CdpSender): Promise<Set<string>> {
+  const ids = new Set<string>();
+  const pending: unknown[] = [(await send(cdp, "Page.getFrameTree")).frameTree];
+  while (pending.length) {
+    const node = pending.pop() as { frame?: { id?: unknown }; childFrames?: unknown[] } | undefined;
+    if (!node || typeof node !== "object") continue;
+    if (typeof node.frame?.id === "string") ids.add(node.frame.id);
+    pending.push(...(node.childFrames ?? []));
+  }
+  return ids;
+}
+
 /** The guids Statelock already knows: pass them to waitForDownload to wait for the next one. */
+const UNSETTLED_STATES = new Set(["in_progress", "checking"]);
+
+/** The guids of the downloads that have finished (completed, blocked or canceled). */
+export function settledGuids(entries: Record<string, unknown>[]): Set<string> {
+  return new Set(entries.filter((d) => !UNSETTLED_STATES.has(String(d.state))).map((d) => String(d.guid)));
+}
+
 export async function knownDownloads(cdp: CdpSender): Promise<Set<string>> {
   return new Set((await listDownloads(cdp)).map((d) => String(d.guid)));
 }
@@ -170,15 +228,7 @@ export async function waitForDownload(
   while (Date.now() < deadline) {
     for (const item of await listDownloads(cdp)) {
       if (known.has(String(item.guid))) continue;
-      if (item.state === "completed") {
-        return {
-          guid: String(item.guid),
-          name: String(item.name),
-          url: String(item.url),
-          size: Number(item.size ?? 0),
-          sha256: String(item.sha256),
-        };
-      }
+      if (item.state === "completed") return completedInfo(item);
       if (item.state === "blocked") {
         throw new StatelockPolicyViolationError({
           rule: typeof item.rule === "string" ? item.rule : null,
@@ -227,6 +277,20 @@ export interface FetchOptions {
   headers?: Record<string, string>;
   /** Bytes or text; an object is sent as JSON. */
   data?: Uint8Array | string | Record<string, unknown> | unknown[];
+  /** Sent URL-encoded (Content-Type application/x-www-form-urlencoded unless set). */
+  form?: Record<string, string | number | boolean>;
+  /** Appended to the URL's query. */
+  params?: Record<string, string | number | boolean> | string;
+  /** Throw StatelockRequestError for a status outside 2xx. */
+  failOnStatusCode?: boolean;
+}
+
+/** Statelock declined or could not make the request (the message says why). */
+export class StatelockRequestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StatelockRequestError";
+  }
 }
 
 /** The response of a governed request, with Playwright's APIResponse API. */
@@ -286,26 +350,58 @@ export class StatelockResponse {
   async dispose(): Promise<void> {}
 }
 
+function withQuery(url: string, params: FetchOptions["params"]): string {
+  if (!params) return url;
+  const query =
+    typeof params === "string"
+      ? params
+      : new URLSearchParams(Object.entries(params).map(([name, value]) => [name, String(value)])).toString();
+  if (!query) return url;
+  const hash = url.indexOf("#");
+  const [base, fragment] = hash < 0 ? [url, ""] : [url.slice(0, hash), url.slice(hash)];
+  return `${base}${base.includes("?") ? "&" : "?"}${query}${fragment}`;
+}
+
+function requestBody(headers: Record<string, string>, options: FetchOptions): Buffer | null {
+  const typed = Object.keys(headers).some((h) => h.toLowerCase() === "content-type");
+  const { data, form } = options;
+  if (form !== undefined) {
+    if (!typed) headers["Content-Type"] = "application/x-www-form-urlencoded";
+    const encoded = new URLSearchParams(Object.entries(form).map(([name, value]) => [name, String(value)]));
+    return Buffer.from(encoded.toString(), "utf8");
+  }
+  if (data === undefined || data === null) return null;
+  if (typeof data === "string") return Buffer.from(data, "utf8");
+  if (data instanceof Uint8Array) return Buffer.from(data);
+  if (!typed) headers["Content-Type"] = "application/json";
+  return Buffer.from(JSON.stringify(data), "utf8");
+}
+
 /**
  * Have Statelock make an HTTP request in the page, with the browser's session
  * (policy request_access). Header values may use {{secret:name}} placeholders.
- * A declined request rejects with the reason.
+ * A declined request throws StatelockRequestError. When the session ended (a violation,
+ * a closed connection), the error is thrown as is, so guard() turns it into
+ * StatelockPolicyViolationError.
  */
 export async function statelockFetch(cdp: CdpSender, url: string, options: FetchOptions = {}): Promise<StatelockResponse> {
   const headers = { ...(options.headers ?? {}) };
-  let body: Buffer | null = null;
-  const { data } = options;
-  if (typeof data === "string") body = Buffer.from(data, "utf8");
-  else if (data instanceof Uint8Array) body = Buffer.from(data);
-  else if (data !== undefined) {
-    body = Buffer.from(JSON.stringify(data), "utf8");
-    if (!Object.keys(headers).some((h) => h.toLowerCase() === "content-type")) headers["Content-Type"] = "application/json";
+  const body = requestBody(headers, options);
+  let result: Record<string, unknown>;
+  try {
+    result = await send(cdp, REQUEST_COMMAND, {
+      url: withQuery(url, options.params),
+      method: (options.method ?? "GET").toUpperCase(),
+      headers,
+      body: body ? body.toString("base64") : null,
+    });
+  } catch (error) {
+    if (mayBeViolation(error)) throw error; // the session ended: guard() reports why
+    throw new StatelockRequestError(error instanceof Error ? error.message : String(error));
   }
-  const result = await send(cdp, REQUEST_COMMAND, {
-    url,
-    method: (options.method ?? "GET").toUpperCase(),
-    headers,
-    body: body ? body.toString("base64") : null,
-  });
-  return new StatelockResponse(result);
+  const response = new StatelockResponse(result);
+  if (options.failOnStatusCode && !response.ok()) {
+    throw new StatelockRequestError(`${response.status()} ${response.statusText()} for ${response.url()}`);
+  }
+  return response;
 }

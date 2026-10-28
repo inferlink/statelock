@@ -114,7 +114,7 @@ export async function fetchViolation(
 const CLOSED_TEXTS = ["has been closed", "Target closed", "Transport closed", "socket-close", "WebSocket is not open", "CDP connection closed"];
 
 /** Only a closed session or the marker can mean Statelock ended the session. */
-function mayBeViolation(error: unknown): boolean {
+export function mayBeViolation(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const text = `${error.name}: ${error.message}`;
   return error.name === "TargetClosedError" || text.includes(VIOLATION_MARKER) || CLOSED_TEXTS.some((t) => text.includes(t));
