@@ -93,7 +93,7 @@ For the test suite, base-proxy Docker setup and other demos, see [Development](#
    - cancels synthetic clicks, submits, drops and pastes (`element.click()`, `dispatch_event`);
    - clears files that code puts into file inputs (including Playwright's own `set_input_files` over remote CDP; `statelock.client.install()` routes it through Statelock, see [Files](https://github.com/inferlink/statelock/blob/main/README.md#files));
    - blocks page loads and requests started by the agent's own page code;
-   - blocks form submissions code makes (`form.submit()`, and `form.requestSubmit()` outside a real click, Enter or touch);
+   - blocks form submissions code makes (`form.submit()`, and `form.requestSubmit()` outside a real click, Enter or touch). This includes a site's own tracking scripts: with `untrusted_form_submissions: decline` such a submission is blocked and recorded, and the session continues;
    - also guards the page's iframes (srcdoc, about:blank and other origins), like the page.
 4. **Governed input.** For each input command (mouse, key, text, touch, drag and drop, IME, gestures, and `DOM.setFileInputFiles`) Statelock:
    - captures state from the command's tab, in its own isolated world: URL, text, the element under the pointer or focused, fields, accessibility tree, screenshot;
@@ -118,6 +118,7 @@ policies:
     agent_id: finance_reconciliation_agent     # required
     target_url_contains: /demo/finance          # omit to apply to every page
     allow_synthetic_events: false               # true disables the page guard for this policy
+    untrusted_form_submissions: end_session     # decline: block and record code-made form submissions, keep the session
     pre_conditions:                             # one rule per entry, optionally with a trigger
       - require_page_text: {values: [Bank Deposit, ERP Invoice]}
       - assert_field_equal: {left: bank_deposit_amount, right: erp_invoice_amount}

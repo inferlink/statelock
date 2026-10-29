@@ -434,10 +434,13 @@ class ActionGovernor:
         else:
             await self.reporter.terminate(context, verdict, CLOSE_CODE_PRE_CONDITION, answer=action)
 
-    async def _record_command(self, action: CdpAction, verdict: PolicyVerdict) -> tuple[ActionContext, str]:
-        """Capture the command's tab and write its record. Returns the context and the record's location."""
+    async def _record_command(
+        self, action: CdpAction, verdict: PolicyVerdict, target_id: str | None = None
+    ) -> tuple[ActionContext, str]:
+        """Capture the command's tab (or ``target_id``) and write its record. Returns the context
+        and the record's location."""
         async with self.writer.slot() as slot:
-            state = await self.capture(action)
+            state = await self.capture(action, target_id)
             context = self._context(slot.sequence, action, state)
             location = await slot.write(build_action_record(context, verdict))
         return context, location
@@ -495,6 +498,20 @@ class ActionGovernor:
             logger.warning("Statelock guard violation rule=%s session=%s at %s", kind, self.session_id, location)
         except Exception:
             logger.exception("Failed to handle guard violation for session %s", self.session_id)
+
+    async def on_guard_decline(self, target_id: str, event: dict[str, Any]) -> None:
+        """Record a guard event the policy declines (the page guard already blocked it);
+        the session continues."""
+        kind = str(event.get("kind") or "")
+        if self.reporter.terminating:
+            return
+        try:
+            action = CdpAction(message_id=None, method=violation_method(kind), kind=ActionKind.SYNTHETIC, params=event)
+            verdict = PolicyVerdict.block(reason=violation_reason(event), rule=kind, evidence={"event": event})
+            _context, location = await self._record_command(action, verdict, target_id)
+            logger.info("Declined guard event rule=%s session=%s at %s", kind, self.session_id, location)
+        except Exception:
+            logger.exception("Failed to record a declined guard event for session %s", self.session_id)
 
     async def on_request_record(self, record: dict[str, Any]) -> None:
         line = self.scrubber.data(build_network_record(record))

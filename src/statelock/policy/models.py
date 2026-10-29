@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, field_validator, model_validator
 
@@ -28,6 +28,11 @@ class PolicyConfig(BaseModel):
     # False (default): clicks, submits and requests not produced by real input
     # or the site's own code are blocked on this policy's pages.
     allow_synthetic_events: bool = False
+    # What a form submission code makes (form.submit(), requestSubmit() outside real input)
+    # does on this policy's pages: end_session (default), or decline: the submission is
+    # blocked and recorded, and the session continues (e.g. a site's tracking pixel on a
+    # read-only crawl). Decline applies only when every guarded policy for the page says so.
+    untrusted_form_submissions: Literal["end_session", "decline"] = "end_session"
     # Named page values for rules; see statelock.policy.fields.
     fields: list[FieldSpec] = Field(default_factory=list)
     pre_conditions: list[SerializeAsAny[Rule]] = Field(default_factory=list)

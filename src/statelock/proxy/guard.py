@@ -215,6 +215,8 @@ class PageGuard:
         on_script_click: ScriptClickHandler | None = None,
         agent_script_active: Callable[[str], bool] = lambda _target_id: False,
         on_stalled_load: Callable[[str, str], None] = lambda _target_id, _url: None,
+        on_decline: ViolationHandler | None = None,
+        declines_form_submission: Callable[[str | None], bool] = lambda _page_url: False,
     ) -> None:
         self.pages = pages
         self.url_patterns = url_patterns
@@ -224,6 +226,10 @@ class PageGuard:
         self.on_script_click = on_script_click
         self.agent_script_active = agent_script_active
         self.on_stalled_load = on_stalled_load
+        # A declined guard event: blocked and recorded; the session continues.
+        self.on_decline = on_decline
+        # Whether the policy for a page declines code-made form submissions (page URL).
+        self.declines_form_submission = declines_form_submission
         # Statelock sessionId -> per-target state
         self._states: dict[str, TargetGuardState] = {}
         self._tasks = BackgroundTasks("page guard")
@@ -276,6 +282,26 @@ class PageGuard:
         """A request or submission on a target is governed when a URL is, or when the target
         is a frame of a governed page (unknown parents count as governed: fail closed)."""
         return self.is_governed(state.main_frame_url, *urls) or self._in_governed_page(state)
+
+    def _page_url(self, state: TargetGuardState) -> str | None:
+        """The URL of the page a target belongs to: its own, or for a frame target the page's
+        it is in (None when that page is not tracked)."""
+        for _depth in range(MAX_FRAME_DEPTH):
+            if state.parent_frame_id is None:
+                return state.main_frame_url
+            parent = next((s for s in self._states.values() if s.target_id == state.parent_frame_id), None)
+            if parent is None:
+                return None
+            state = parent
+        return None
+
+    def _declined(self, state: TargetGuardState, kind: str | None) -> bool:
+        """A code-made form submission the page's policy declines rather than ending the session."""
+        return (
+            kind == SystemRule.UNTRUSTED_FORM_SUBMISSION.value
+            and self.on_decline is not None
+            and self.declines_form_submission(self._page_url(state))
+        )
 
     def _in_governed_page(self, state: TargetGuardState) -> bool:
         for _depth in range(MAX_FRAME_DEPTH):  # frame targets followed up to the page they are in
@@ -616,6 +642,7 @@ class PageGuard:
             if resource_type == DOCUMENT:
                 await self._navigation_lookups(state)
             initiated_by, kind, governed = self._classify(state, url, resource_type, attribution)
+            declined = self._declined(state, kind)
             record = {
                 "kind": kind or "request",
                 "target_id": state.target_id,
@@ -628,6 +655,8 @@ class PageGuard:
                 "decision": "block" if kind else "allow",
                 "initiator": attribution,
             }
+            if declined:
+                record["session_continues"] = True
             if self.on_request_record is not None:
                 self._tasks.spawn(self.on_request_record(record))
             if kind is None:
@@ -636,6 +665,10 @@ class PageGuard:
                 )
                 return
             await self._fail_request(session_id, fetch_request_id)
+            if declined:
+                assert self.on_decline is not None  # noqa: S101 - _declined checked it
+                await self.on_decline(state.target_id, record)
+                return
             await self.on_violation(state.target_id, record)
         except Exception as error:  # noqa: BLE001 - fail closed: an undecided request is never released
             logger.warning("Guard decision failed for %s: %s", url, error)
@@ -672,6 +705,12 @@ def violation_reason(event: dict[str, Any]) -> str:
             f"{event.get('url')}: it was started by the agent's page code "
             "(page.evaluate or similar), not by real input or the site's own code. "
             "Use real clicks and typing, or page.goto() for navigation."
+        )
+    if kind == SystemRule.UNTRUSTED_FORM_SUBMISSION.value and event.get("session_continues"):
+        return (
+            f"Declined form submission to {event.get('url')}: the form was submitted by code "
+            "(form.submit()) without a real submit action. The policy declines such submissions "
+            "(untrusted_form_submissions: decline): the submission was blocked and the session continues."
         )
     if kind == SystemRule.UNTRUSTED_FORM_SUBMISSION.value:
         return (

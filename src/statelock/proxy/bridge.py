@@ -484,6 +484,10 @@ class CdpBridge:
             on_script_click=replayer.replay if settings.replay_script_clicks else None,
             agent_script_active=scripts.active,
             on_stalled_load=lambda _target_id, _url: browser_stalled.set(),
+            on_decline=governor.on_guard_decline,
+            declines_form_submission=lambda page_url: self.services.evaluator.declines_untrusted_form_submissions(
+                agent_id, page_url
+            ),
         )
 
     async def _run_pumps(self, session: _Session, browser: GovernedBrowser) -> None:

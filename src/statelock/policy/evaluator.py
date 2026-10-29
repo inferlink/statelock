@@ -86,6 +86,13 @@ class PolicyEvaluator:
             patterns.append(policy.target_url_contains)
         return patterns
 
+    def declines_untrusted_form_submissions(self, agent_id: str | None, url: str | None) -> bool:
+        """Whether a form submission made by code on this page is declined (blocked and
+        recorded; the session continues) rather than ending the session: only when every
+        guarded policy of the agent for the page sets ``untrusted_form_submissions: decline``."""
+        guarded = [p for p in self.policies if not p.allow_synthetic_events and p.applies_to(agent_id, url)]
+        return bool(guarded) and all(p.untrusted_form_submissions == "decline" for p in guarded)
+
     def field_specs(self, agent_id: str | None) -> list[ScopedField]:
         """This agent's named fields, each scoped to its url_contains or its policy's target."""
         scoped: list[ScopedField] = []
