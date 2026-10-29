@@ -47,6 +47,7 @@ AGENTS = (
     "cookie_agent",
     "secret_agent",
     "request_agent",
+    "crawl_agent",
 )
 # The secret the secrets file gives secret_agent on /gov/signin (credential injection tests).
 PORTAL_PASSWORD = "test-password-not-secret-$$"  # noqa: S105 - a fake value
@@ -110,6 +111,9 @@ policies:
         max_response_bytes: 200000
       - url_pattern: '^http://127\\.0\\.0\\.1:[0-9]+/gov/redirect-(me|away)$'
       - url_pattern: '^http://127\\.0\\.0\\.1:[0-9]+/gov/redirect-plain$'
+  - agent_id: crawl_agent
+    target_url_contains: /gov/
+    untrusted_form_submissions: decline
 """
 
 SITE = {
@@ -149,6 +153,15 @@ SITE = {
 <a id=exe href="/gov/files/tool.exe">Download tool</a>
 <a id=big href="/gov/files/big.bin">Download archive</a>
 </body></html>""",
+    # The site's own tracking code posts a form into a hidden iframe from a timer (like a
+    # tracking pixel): a code-made form submission with no user action.
+    "/gov/pixel": """<html><head><title>Profile</title></head><body><p>Staff profile</p>
+<script>setTimeout(() => {
+  const frame = document.createElement('iframe'); frame.name = 'trk'; frame.style.display = 'none';
+  document.body.append(frame);
+  const form = document.createElement('form'); form.method = 'post'; form.target = 'trk'; form.action = '/gov/result';
+  document.body.append(form); form.submit();
+}, 100);</script></body></html>""",
     "/gov/framed": """<html><head><title>Framed</title></head><body>
 <iframe id=docs src="/gov/docs"></iframe></body></html>""",
     "/gov/drag": """<html><head><title>Drag</title></head><body>

@@ -104,9 +104,11 @@ that do not appear in a summary or the chat; ask instead.
 
 Statelock YAML is a mapping with one key, `policies`, a list. Each policy needs
 `agent_id` and may have `id`, `target_url_contains`, `fields`,
-`pre_conditions`, `post_conditions`, `cookie_access`, `request_access` and
-`allow_synthetic_events` (leave the last three out unless the developer asks
-for them). `target_url_contains` matches the page's scheme://host/path, never
+`pre_conditions`, `post_conditions`, `cookie_access`, `request_access`,
+`allow_synthetic_events` and `untrusted_form_submissions` (leave the last four
+out unless the developer asks for them; `untrusted_form_submissions: decline`
+keeps the session going when page code submits a form, such as a site's
+tracking script, and still blocks the submission). `target_url_contains` matches the page's scheme://host/path, never
 its query: a path is matched as a substring; an absolute
 `https://host/path` scope requires that origin and that path or one below it.
 

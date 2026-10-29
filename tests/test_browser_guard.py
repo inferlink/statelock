@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import pytest
@@ -212,6 +213,62 @@ def test_agent_code_side_effects_are_blocked(server: dict[str, Any], name: str, 
     _, result = run_session(server, "flow_agent", "/gov/form", steps)
     assert isinstance(result, StatelockPolicyViolationError), name
     assert result.rule == rule
+
+
+def _declined_submission(server: dict[str, Any], session_id: str) -> dict[str, Any]:
+    """The network record of the declined submission to /gov/result (waits for it)."""
+    for _ in range(50):
+        found = [e for e in network_log(server, session_id) if e["url"].endswith("/gov/result")]
+        if found:
+            return found[0]
+        time.sleep(0.1)
+    raise AssertionError("no record of the submission")
+
+
+def test_a_sites_own_form_submission_ends_the_session_by_default(server: dict[str, Any]) -> None:
+    async def steps(page: Any) -> str:
+        await wait_for_proxy_close(page)
+        return str(await page.title())
+
+    _, result = run_session(server, "flow_agent", "/gov/pixel", steps)
+    assert isinstance(result, StatelockPolicyViolationError), result
+    assert result.rule == "untrusted_form_submission"
+
+
+def test_a_declined_form_submission_is_blocked_and_the_session_continues(server: dict[str, Any]) -> None:
+    """untrusted_form_submissions: decline (e.g. a tracking pixel on a read-only crawl)."""
+
+    async def steps(page: Any) -> str:
+        await page.wait_for_function("document.querySelector('iframe[name=trk]') !== null")
+        await page.wait_for_timeout(1000)
+        await page.goto(page.url.replace("/gov/pixel", "/gov/form"))
+        return str(await page.title())
+
+    session_id, result = run_session(server, "crawl_agent", "/gov/pixel", steps)
+    assert result == "Form"  # the session went on
+    entry = _declined_submission(server, session_id)
+    assert (entry["kind"], entry["decision"], entry["session_continues"]) == (
+        "untrusted_form_submission",
+        "block",
+        True,
+    )
+    [record] = actions(server, session_id, "Statelock.untrustedFormSubmission")
+    assert record["verdict"]["decision"] == "block"
+    assert "the session continues" in record["verdict"]["reason"]
+
+
+def test_an_agents_own_form_submission_is_declined_too(server: dict[str, Any]) -> None:
+    """Decline does not guess who submitted: the agent's form.submit() is blocked the same way."""
+
+    async def steps(page: Any) -> str:
+        await page.evaluate("document.getElementById('f').submit()")
+        await page.wait_for_timeout(1000)
+        return str(await page.title())
+
+    session_id, result = run_session(server, "crawl_agent", "/gov/form", steps)
+    # The session goes on; the tab shows Chromium's page for a blocked navigation.
+    assert not isinstance(result, StatelockPolicyViolationError), result
+    assert _declined_submission(server, session_id)["decision"] == "block"
 
 
 def test_reload_script_is_attributed_to_agent_code(server: dict[str, Any]) -> None:

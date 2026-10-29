@@ -285,6 +285,26 @@ def test_guard_url_patterns() -> None:
     assert ev.guard_url_patterns("c") == []
 
 
+def test_untrusted_form_submissions_are_declined_only_when_every_guarded_policy_says_so() -> None:
+    ev = evaluator(
+        {"agent_id": "a", "untrusted_form_submissions": "decline"},
+        {"agent_id": "b", "target_url_contains": "/crawl", "untrusted_form_submissions": "decline"},
+        {"agent_id": "b", "target_url_contains": "/crawl/act"},
+        {"agent_id": "c", "target_url_contains": "/open", "allow_synthetic_events": True},
+        {"agent_id": "d"},
+    )
+    assert ev.declines_untrusted_form_submissions("a", "https://any.test/page")
+    assert ev.declines_untrusted_form_submissions("b", "https://site.test/crawl/list")
+    # Another guarded policy for the page ends the session: the strictest one wins.
+    assert not ev.declines_untrusted_form_submissions("b", "https://site.test/crawl/act")
+    # No guarded policy for the page: nothing to decline (the guard does not act there).
+    assert not ev.declines_untrusted_form_submissions("b", "https://site.test/elsewhere")
+    assert not ev.declines_untrusted_form_submissions("c", "https://site.test/open")
+    assert not ev.declines_untrusted_form_submissions("d", "https://site.test/page")  # the default
+    with pytest.raises(ValidationError):
+        evaluator({"agent_id": "e", "untrusted_form_submissions": "allow"})
+
+
 def test_target_element_label_text() -> None:
     assert TargetElement(text=" Pay ", aria_label="Pay invoice").label_text == "Pay Pay invoice"
     assert TargetElement().label_text == ""
