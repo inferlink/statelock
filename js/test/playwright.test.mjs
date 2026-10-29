@@ -341,3 +341,33 @@ test("the session's setInputFiles and expectDownload work without install()", as
     await governed.close();
   }
 });
+
+test("connectPlaywright: a new context with its own userAgent is governed", async () => {
+  // Playwright's context options work through Statelock as on a plain browser.
+  const userAgent = "Mozilla/5.0 (StatelockTest) Chrome/156.0.0.0 Safari/537.36";
+  const governed = await connectPlaywright(chromium, {
+    serverUrl: server.base,
+    apiKey: key("finance_reconciliation_agent"),
+  });
+  try {
+    const context = await governed.browser.newContext({ userAgent });
+    const page = await context.newPage();
+    await page.goto(`${server.base}/gov/user-agent`);
+    assert.equal(JSON.parse(await page.innerText("body")).user_agent, userAgent);
+    assert.equal(await page.evaluate(() => navigator.userAgent), userAgent);
+    await assert.rejects(
+      governed.guard(async () => {
+        await page.goto(`${server.base}/demo/finance?scenario=mismatch`);
+        await page.click("text=Mark as Paid");
+        await page.title();
+      }),
+      (error) => {
+        assert.ok(error instanceof StatelockPolicyViolationError, String(error));
+        assert.equal(error.rule, "assert_field_equal");
+        return true;
+      },
+    );
+  } finally {
+    await governed.close();
+  }
+});
